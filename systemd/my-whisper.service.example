@@ -1,0 +1,14 @@
+[Unit]
+Description=MyWhispr hold-to-record dictation daemon
+After=pipewire.service wireplumber.service ydotool.service
+Wants=ydotool.service
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/MyWhispr
+ExecStart=/path/to/MyWhispr/bin/my-whisper-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

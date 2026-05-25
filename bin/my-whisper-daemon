@@ -1,0 +1,1201 @@
+#!/usr/bin/env python3
+import errno
+import fcntl
+import html
+import http.server
+import json
+import logging
+import math
+import os
+import selectors
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid
+import wave
+from datetime import datetime
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.environ.get("MYWHISPR_CONFIG", os.path.join(ROOT, "config.json"))
+EVENT_STRUCT = struct.Struct("llHHI")
+EV_KEY = 0x01
+KEY_VALUE_RELEASE = 0
+
+
+def ev_ioctl_name(length):
+    return 0x80004506 + (length << 16)
+
+
+class MyWhisperDaemon:
+    def __init__(self):
+        self.cfg = self.load_config()
+        self.runtime_dir = self.cfg["runtime_dir"]
+        self.log_dir = self.cfg["log_dir"]
+        os.makedirs(self.runtime_dir, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            handlers=[
+                logging.FileHandler(os.path.join(self.log_dir, "my-whisper.log")),
+                logging.StreamHandler(sys.stdout),
+            ],
+        )
+
+        self.lock = threading.RLock()
+        self.shutdown_event = threading.Event()
+        self.record_proc = None
+        self.recording = None
+        self.processing = False
+        self.last_stop_time = 0.0
+        self.server_proc = None
+        self.server_started_by_us = False
+        self.server_log_path = os.path.join(self.log_dir, "whisper-server.log")
+        self.last_server_use = 0.0
+        self.history_path = self.cfg.get("history_path", os.path.join(self.log_dir, "history.jsonl"))
+        self.httpds = []
+        self.cue_paths = self.prepare_audio_cues()
+
+    def load_config(self):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def notify(self, title, body=""):
+        if not self.cfg.get("notifications_enabled", True):
+            return
+        if not shutil.which("notify-send"):
+            return
+        subprocess.run(
+            ["notify-send", "-a", self.cfg.get("name", "MyWhisper"), title, body, "-t", "1800"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    def prepare_audio_cues(self):
+        cfg = self.cfg.get("audio_cues", {})
+        if not cfg.get("enabled", False):
+            return {}
+
+        cue_dir = os.path.join(self.runtime_dir, "cues")
+        os.makedirs(cue_dir, exist_ok=True)
+        paths = {
+            "start": os.path.join(cue_dir, "openwhispr-start.wav"),
+            "stop": os.path.join(cue_dir, "openwhispr-stop.wav"),
+        }
+        self.write_tone_sequence(paths["start"], cfg.get("start_frequencies", []), cfg)
+        self.write_tone_sequence(paths["stop"], cfg.get("stop_frequencies", []), cfg)
+        return paths
+
+    def write_tone_sequence(self, path, frequencies, cfg):
+        sample_rate = int(cfg.get("sample_rate", 44100))
+        tone_seconds = float(cfg.get("tone_seconds", 0.09))
+        gap_seconds = float(cfg.get("gap_seconds", 0.025))
+        attack_seconds = float(cfg.get("attack_seconds", 0.015))
+        gain = float(cfg.get("gain", 0.2))
+        floor_gain = float(cfg.get("floor_gain", 0.0001))
+        samples = []
+
+        for index, frequency in enumerate(frequencies):
+            if index:
+                samples.extend([0] * int(sample_rate * gap_seconds))
+            tone_count = max(1, int(sample_rate * tone_seconds))
+            attack_count = max(1, int(sample_rate * attack_seconds))
+            for i in range(tone_count):
+                t = i / sample_rate
+                if i < attack_count:
+                    envelope = floor_gain + (gain - floor_gain) * (i / attack_count)
+                else:
+                    progress = (i - attack_count) / max(1, tone_count - attack_count)
+                    envelope = gain * ((floor_gain / gain) ** progress)
+                value = math.sin(2.0 * math.pi * float(frequency) * t) * envelope
+                samples.append(max(-32767, min(32767, int(value * 32767))))
+
+        with wave.open(path, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(struct.pack("<" + "h" * len(samples), *samples))
+
+    def play_cue(self, kind):
+        cfg = self.cfg.get("audio_cues", {})
+        if not cfg.get("enabled", False):
+            return
+        path = self.cue_paths.get(kind)
+        player = cfg.get("player_command", "pw-play")
+        if not path or not shutil.which(player):
+            return
+        try:
+            subprocess.Popen(
+                [player, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as e:
+            logging.debug("failed to play %s cue: %s", kind, e)
+
+    def run(self):
+        threading.Thread(target=self.input_event_loop, name="input-events", daemon=True).start()
+        threading.Thread(target=self.maximum_recording_watchdog, name="recording-watchdog", daemon=True).start()
+        threading.Thread(target=self.whisper_idle_watchdog, name="whisper-idle-watchdog", daemon=True).start()
+        threading.Thread(target=self.web_loop, name="web-ui", daemon=True).start()
+        self.socket_loop()
+
+    def web_loop(self):
+        web_cfg = self.cfg.get("web", {})
+        host = web_cfg.get("host", "127.0.0.1")
+        port = int(web_cfg.get("port", 16666))
+
+        class ReusableServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        handler = self.make_web_handler()
+        try:
+            httpd = ReusableServer((host, port), handler)
+        except OSError:
+            logging.exception("failed to start web UI on %s:%s", host, port)
+            return
+        with self.lock:
+            self.httpds.append(httpd)
+        logging.info("web UI listening at http://%s:%s", host, port)
+        threading.Thread(
+            target=httpd.serve_forever,
+            kwargs={"poll_interval": 0.25},
+            name=f"web-ui-{port}",
+            daemon=True,
+        ).start()
+
+        while not self.shutdown_event.is_set():
+            time.sleep(0.5)
+
+    def make_web_handler(self):
+        daemon = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            server_version = "MyWhisperHTTP/1.0"
+
+            def log_message(self, fmt, *args):
+                logging.debug("web: " + fmt, *args)
+
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path in ("/", "/index.html"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(daemon.web_index().encode("utf-8"))
+                    return
+                if parsed.path == "/api/status":
+                    self.send_json(daemon.web_status())
+                    return
+                if parsed.path == "/api/history":
+                    self.send_json({"ok": True, "history": daemon.read_history(5)})
+                    return
+                if parsed.path == "/api/words":
+                    self.send_json({"ok": True, "words": daemon.get_custom_words()})
+                    return
+                self.send_json({"ok": False, "error": "not found"}, status=404)
+
+            def do_POST(self):
+                parsed = urllib.parse.urlparse(self.path)
+                payload = self.read_json()
+                try:
+                    if parsed.path == "/api/copy":
+                        text = payload.get("text")
+                        if not text and payload.get("id"):
+                            text = daemon.history_text_by_id(payload["id"])
+                        if not text:
+                            self.send_json({"ok": False, "error": "missing text"}, status=400)
+                            return
+                        self.send_json({"ok": daemon.copy_to_clipboard(text)})
+                        return
+                    if parsed.path == "/api/words":
+                        words = payload.get("words")
+                        if words is None:
+                            words = payload.get("word", "")
+                        result = daemon.add_custom_words(words)
+                        self.send_json(result)
+                        return
+                    if parsed.path == "/api/warm":
+                        daemon.ensure_whisper_server()
+                        self.send_json({"ok": True, "server": "ready"})
+                        return
+                    if parsed.path == "/api/unload":
+                        daemon.stop_whisper_server()
+                        self.send_json({"ok": True, "server": "unloaded"})
+                        return
+                    if parsed.path == "/api/stop":
+                        self.send_json(daemon.stop_recording("web-stop"))
+                        return
+                    if parsed.path == "/api/reload":
+                        daemon.reload_config()
+                        self.send_json({"ok": True, "config": "reloaded"})
+                        return
+                except Exception as e:
+                    logging.exception("web request failed")
+                    self.send_json({"ok": False, "error": str(e)}, status=500)
+                    return
+                self.send_json({"ok": False, "error": "not found"}, status=404)
+
+            def read_json(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0:
+                    return {}
+                raw = self.rfile.read(length).decode("utf-8", errors="replace")
+                return json.loads(raw or "{}")
+
+            def send_json(self, data, status=200):
+                body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        return Handler
+
+    def web_index(self):
+        name = html.escape(self.cfg.get("name", "MyWhisper"))
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{name}</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #f7f7f5;
+      --fg: #171717;
+      --muted: #6f6f67;
+      --line: #d8d8d2;
+      --panel: #ffffff;
+      --accent: #176b5b;
+      --bad: #9a3412;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #191a18;
+        --fg: #f4f3ee;
+        --muted: #aaa79d;
+        --line: #3c3d39;
+        --panel: #22231f;
+        --accent: #7fd6bd;
+        --bad: #ffb089;
+      }}
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }}
+    main {{ max-width: 920px; margin: 0 auto; padding: 20px; }}
+    header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }}
+    h1 {{ font-size: 20px; margin: 0; font-weight: 650; letter-spacing: 0; }}
+    h2 {{ font-size: 13px; margin: 0 0 10px; text-transform: uppercase; color: var(--muted); letter-spacing: .08em; }}
+    section {{ border-top: 1px solid var(--line); padding: 16px 0; }}
+    button, input {{
+      font: inherit;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--fg);
+      border-radius: 6px;
+      min-height: 34px;
+    }}
+    button {{ padding: 0 11px; cursor: pointer; }}
+    button.primary {{ border-color: var(--accent); color: var(--accent); }}
+    button:disabled {{ opacity: .5; cursor: default; }}
+    input {{ width: 100%; padding: 0 10px; }}
+    .status {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--muted); }}
+    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; background: var(--panel); }}
+    .pill.on {{ color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }}
+    .pill.bad {{ color: var(--bad); }}
+    .actions {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+    .history {{ display: grid; gap: 10px; }}
+    .entry {{ display: grid; grid-template-columns: 110px 1fr auto; gap: 12px; align-items: start; padding: 11px 0; border-top: 1px solid var(--line); }}
+    .entry:first-child {{ border-top: 0; }}
+    .meta {{ color: var(--muted); font-size: 12px; white-space: nowrap; }}
+    .lang {{ color: var(--accent); font-weight: 650; }}
+    .text {{ white-space: pre-wrap; word-break: break-word; }}
+    .config {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 16px; }}
+    .config-row {{ min-width: 0; }}
+    .config-key {{ color: var(--muted); font-size: 12px; }}
+    .config-value {{ overflow-wrap: anywhere; }}
+    .word-form {{ display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 10px; }}
+    .words {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+    .word {{ border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); background: var(--panel); }}
+    .toast {{ min-height: 20px; color: var(--muted); margin-top: 8px; }}
+    @media (max-width: 640px) {{
+      main {{ padding: 14px; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+      .entry {{ grid-template-columns: 1fr; gap: 6px; }}
+      .entry button {{ width: max-content; }}
+      .word-form {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>{name}</h1>
+      <div class="status" id="status"></div>
+    </header>
+
+    <section>
+      <h2>Controls</h2>
+      <div class="status">
+        <span class="pill">grave: English</span>
+        <span class="pill">Ctrl+grave: Ukrainian</span>
+      </div>
+      <div class="actions">
+        <button class="primary" data-action="warm">Warm model</button>
+        <button data-action="unload">Unload model</button>
+        <button data-action="stop">Stop recording</button>
+      </div>
+      <div class="toast" id="actionToast"></div>
+    </section>
+
+    <section>
+      <h2>Last Dictations</h2>
+      <div class="history" id="history"></div>
+    </section>
+
+    <section>
+      <h2>Configuration</h2>
+      <div class="config" id="config"></div>
+    </section>
+
+    <section>
+      <h2>Custom Words</h2>
+      <form class="word-form" id="wordForm">
+        <input id="wordInput" autocomplete="off" placeholder="Add word, name, or comma-separated list">
+        <button class="primary" type="submit">Add</button>
+      </form>
+      <div class="words" id="words"></div>
+      <div class="toast" id="wordToast"></div>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.getElementById('status');
+    const historyEl = document.getElementById('history');
+    const configEl = document.getElementById('config');
+    const wordsEl = document.getElementById('words');
+    const actionToast = document.getElementById('actionToast');
+    const wordToast = document.getElementById('wordToast');
+    const wordForm = document.getElementById('wordForm');
+    const wordInput = document.getElementById('wordInput');
+
+    async function api(path, options = {{}}) {{
+      const res = await fetch(path, {{
+        ...options,
+        headers: {{ 'Content-Type': 'application/json', ...(options.headers || {{}}) }}
+      }});
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || 'request failed');
+      return data;
+    }}
+
+    function setToast(el, text) {{
+      el.textContent = text;
+      if (text) setTimeout(() => {{ if (el.textContent === text) el.textContent = ''; }}, 1800);
+    }}
+
+    function renderStatus(data) {{
+      const bits = [];
+      const state = data.recording ? 'recording' : data.processing ? 'processing' : 'idle';
+      bits.push(`<span class="pill ${{state === 'idle' ? '' : 'on'}}">${{state}}</span>`);
+      bits.push(`<span class="pill">${{data.model}}</span>`);
+      bits.push(`<span class="pill ${{data.server_pid ? 'on' : ''}}">model ${{data.server_pid ? 'loaded' : 'unloaded'}}</span>`);
+      statusEl.innerHTML = bits.join('');
+    }}
+
+    function renderHistory(items) {{
+      if (!items.length) {{
+        historyEl.innerHTML = '<div class="meta">No dictations recorded yet.</div>';
+        return;
+      }}
+      historyEl.innerHTML = items.map(item => `
+        <div class="entry">
+          <div class="meta"><div class="lang">${{escapeHtml(item.language_label || item.language)}}</div><div>${{escapeHtml(item.created_at || '')}}</div></div>
+          <div class="text">${{escapeHtml(item.text || '')}}</div>
+          <button data-copy="${{escapeHtml(item.id)}}">Copy</button>
+        </div>
+      `).join('');
+      historyEl.querySelectorAll('[data-copy]').forEach(btn => {{
+        btn.addEventListener('click', async () => {{
+          const id = btn.getAttribute('data-copy');
+          const item = items.find(x => x.id === id);
+          if (item && navigator.clipboard) {{
+            try {{ await navigator.clipboard.writeText(item.text || ''); }} catch {{}}
+          }}
+          await api('/api/copy', {{ method: 'POST', body: JSON.stringify({{ id }}) }});
+          btn.textContent = 'Copied';
+          setTimeout(() => btn.textContent = 'Copy', 900);
+        }});
+      }});
+    }}
+
+    function renderConfig(config) {{
+      const hotkeys = (config.hotkeys || []).map(item => `${{item.trigger}}: ${{item.language_label}}`).join(', ');
+      const rows = [
+        ['Web UI', config.web_url || ''],
+        ['Model', config.model || ''],
+        ['Hotkeys', hotkeys],
+        ['Max recording', config.maximum_recording_seconds ? config.maximum_recording_seconds + 's' : ''],
+        ['Start cooldown', config.start_cooldown_seconds ? config.start_cooldown_seconds + 's' : '0s'],
+        ['Model idle unload', config.whisper_idle_shutdown_seconds ? config.whisper_idle_shutdown_seconds + 's' : 'off'],
+        ['Custom words', String(config.custom_words_count || 0)]
+      ];
+      configEl.innerHTML = rows.map(([key, value]) => `
+        <div class="config-row">
+          <div class="config-key">${{escapeHtml(key)}}</div>
+          <div class="config-value">${{escapeHtml(value)}}</div>
+        </div>
+      `).join('');
+    }}
+
+    function renderWords(words) {{
+      wordsEl.innerHTML = words.map(w => `<span class="word">${{escapeHtml(w)}}</span>`).join('');
+    }}
+
+    function escapeHtml(value) {{
+      return String(value).replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
+    }}
+
+    async function refresh() {{
+      try {{
+        const data = await api('/api/status');
+        renderStatus(data);
+        renderHistory(data.history || []);
+        renderConfig(data.config || {{}});
+        renderWords(data.custom_words || []);
+      }} catch (e) {{
+        statusEl.innerHTML = `<span class="pill bad">${{escapeHtml(e.message)}}</span>`;
+      }}
+    }}
+
+    document.querySelectorAll('[data-action]').forEach(btn => {{
+      btn.addEventListener('click', async () => {{
+        const action = btn.getAttribute('data-action');
+        btn.disabled = true;
+        try {{
+          await api('/api/' + action, {{ method: 'POST', body: '{{}}' }});
+          setToast(actionToast, action + ' ok');
+          await refresh();
+        }} catch (e) {{
+          setToast(actionToast, e.message);
+        }} finally {{
+          btn.disabled = false;
+        }}
+      }});
+    }});
+
+    wordForm.addEventListener('submit', async event => {{
+      event.preventDefault();
+      const raw = wordInput.value.trim();
+      if (!raw) return;
+      const words = raw.split(/[,\\n]/).map(w => w.trim()).filter(Boolean);
+      try {{
+        const data = await api('/api/words', {{ method: 'POST', body: JSON.stringify({{ words }}) }});
+        wordInput.value = '';
+        renderWords(data.words || []);
+        setToast(wordToast, data.added.length ? 'added: ' + data.added.join(', ') : 'already present');
+      }} catch (e) {{
+        setToast(wordToast, e.message);
+      }}
+    }});
+
+    refresh();
+    setInterval(refresh, 1500);
+  </script>
+</body>
+</html>"""
+
+    def web_status(self):
+        data = self.status()
+        data["history"] = self.read_history(5)
+        data["custom_words"] = self.get_custom_words()
+        web_cfg = self.cfg.get("web", {})
+        host = web_cfg.get("host", "127.0.0.1")
+        port = int(web_cfg.get("port", 16666))
+        data["web"] = {"host": host, "port": port}
+        data["config"] = {
+            "web_url": f"http://{host}:{port}/",
+            "model": self.cfg.get("default_model", ""),
+            "hotkeys": [
+                {
+                    "trigger": trigger,
+                    "language": hotkey.get("language", ""),
+                    "language_label": self.cfg.get("language_labels", {}).get(
+                        hotkey.get("language", ""),
+                        hotkey.get("language", ""),
+                    ),
+                }
+                for trigger, hotkey in self.cfg.get("hotkeys", {}).items()
+            ],
+            "maximum_recording_seconds": self.cfg.get("maximum_recording_seconds"),
+            "start_cooldown_seconds": self.cfg.get("start_cooldown_seconds", 0.75),
+            "whisper_idle_shutdown_seconds": self.cfg.get("whisper_idle_shutdown_seconds", 0),
+            "custom_words_count": len(self.get_custom_words()),
+        }
+        return data
+
+    def socket_loop(self):
+        socket_path = self.cfg["socket_path"]
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(socket_path)
+        os.chmod(socket_path, 0o600)
+        server.listen(8)
+        server.settimeout(0.25)
+        logging.info("daemon listening on %s", socket_path)
+
+        while not self.shutdown_event.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self.handle_client, args=(conn,), daemon=True).start()
+
+        server.close()
+        try:
+            os.unlink(socket_path)
+        except FileNotFoundError:
+            pass
+        self.cleanup()
+
+    def handle_client(self, conn):
+        with conn:
+            try:
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                request = json.loads(data.decode("utf-8"))
+                response = self.handle_command(request)
+            except Exception as e:
+                logging.exception("client command failed")
+                response = {"ok": False, "error": str(e)}
+            conn.sendall(json.dumps(response).encode("utf-8") + b"\n")
+
+    def handle_command(self, request):
+        cmd = request.get("cmd")
+        if cmd == "start":
+            language = request.get("language")
+            trigger = request.get("trigger")
+            return self.start_recording(language, trigger)
+        if cmd == "stop":
+            return self.stop_recording("client-stop")
+        if cmd == "status":
+            return self.status()
+        if cmd == "warm":
+            self.ensure_whisper_server()
+            return {"ok": True, "server": "ready"}
+        if cmd == "unload":
+            self.stop_whisper_server()
+            return {"ok": True, "server": "unloaded"}
+        if cmd == "shutdown":
+            self.shutdown_event.set()
+            return {"ok": True}
+        return {"ok": False, "error": f"unknown command: {cmd}"}
+
+    def status(self):
+        with self.lock:
+            server_pid = self.server_proc.pid if self.server_proc and self.server_proc.poll() is None else None
+            return {
+                "ok": True,
+                "recording": self.recording,
+                "processing": self.processing,
+                "server_pid": server_pid,
+                "model": self.cfg["default_model"],
+            }
+
+    def start_recording(self, language, trigger):
+        with self.lock:
+            now = time.time()
+            cooldown_seconds = float(self.cfg.get("start_cooldown_seconds", 0.75))
+            if cooldown_seconds > 0 and now - self.last_stop_time < cooldown_seconds:
+                logging.info(
+                    "recording start ignored during cooldown language=%s trigger=%s age=%.3f",
+                    language,
+                    trigger,
+                    now - self.last_stop_time,
+                )
+                return {"ok": True, "state": "cooldown-ignored"}
+            if self.recording:
+                return {"ok": True, "state": "already-recording", "recording": self.recording}
+            if self.processing:
+                return {"ok": False, "error": "still processing previous recording"}
+
+            if trigger not in self.cfg["hotkeys"]:
+                return {"ok": False, "error": f"unknown trigger: {trigger}"}
+            if language not in self.cfg["language_labels"]:
+                return {"ok": False, "error": f"unknown language: {language}"}
+
+            recordings_dir = os.path.join(self.runtime_dir, "recordings")
+            os.makedirs(recordings_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            audio_path = os.path.join(recordings_dir, f"{stamp}-{language}.wav")
+
+            command = list(self.cfg["record_command"]) + [audio_path]
+            log = open(os.path.join(self.log_dir, "recorder.log"), "ab", buffering=0)
+            proc = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            self.record_proc = proc
+            self.recording = {
+                "language": language,
+                "trigger": trigger,
+                "audio_path": audio_path,
+                "started_at": time.time(),
+                "pid": proc.pid,
+            }
+            label = self.cfg["language_labels"].get(language, language)
+            logging.info("recording started language=%s trigger=%s pid=%s", language, trigger, proc.pid)
+            self.play_cue("start")
+            self.notify(f"Recording {label}", "Release the hotkey to transcribe")
+            return {"ok": True, "state": "recording", "language": language, "trigger": trigger}
+
+    def stop_recording(self, reason):
+        with self.lock:
+            if not self.recording:
+                return {"ok": True, "state": "idle"}
+
+            recording = self.recording
+            proc = self.record_proc
+            stopped_at = time.time()
+            duration = stopped_at - recording["started_at"]
+            self.recording = None
+            self.record_proc = None
+            self.last_stop_time = stopped_at
+
+        logging.info("recording stop requested reason=%s duration=%.3f", reason, duration)
+        self.stop_recorder_process(proc)
+        self.play_cue("stop")
+
+        if reason == "max-duration":
+            logging.warning("recording discarded after maximum duration")
+            self.notify("Recording discarded", "Maximum length reached")
+            return {"ok": True, "state": "discarded", "reason": "max-duration"}
+
+        if duration < float(self.cfg["minimum_recording_seconds"]):
+            logging.info("recording skipped: too short")
+            self.notify("Recording skipped", "Too short")
+            return {"ok": True, "state": "skipped", "reason": "too-short"}
+
+        with self.lock:
+            self.processing = True
+        threading.Thread(target=self.transcribe_and_paste, args=(recording, duration), daemon=True).start()
+        return {"ok": True, "state": "processing"}
+
+    def stop_recorder_process(self, proc):
+        if not proc:
+            return
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=2.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except ProcessLookupError:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except ProcessLookupError:
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+    def transcribe_and_paste(self, recording, duration):
+        try:
+            audio_path = recording["audio_path"]
+            if not os.path.exists(audio_path) or os.path.getsize(audio_path) < 4096:
+                logging.info("recording skipped: missing or empty wav")
+                self.notify("Recording skipped", "No usable audio")
+                return
+
+            language = recording["language"]
+            label = self.cfg["language_labels"].get(language, language)
+            self.notify(f"Transcribing {label}", self.cfg["default_model"])
+            text = self.transcribe(audio_path, language)
+            text = self.clean_text(text)
+            logging.info("transcription language=%s duration=%.3f chars=%s text=%r", language, duration, len(text), text)
+
+            if not text:
+                self.notify("No text recognized")
+                return
+
+            self.write_last_text(text)
+            pasted = self.paste_text(text)
+            self.append_history(
+                {
+                    "id": uuid.uuid4().hex,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "language": language,
+                    "language_label": self.cfg["language_labels"].get(language, language),
+                    "trigger": recording.get("trigger"),
+                    "duration_seconds": round(duration, 3),
+                    "text": text,
+                    "audio_path": audio_path,
+                    "pasted": pasted,
+                }
+            )
+            if pasted:
+                self.notify("Pasted", text[:80])
+            else:
+                self.notify("Copied only", "Paste shortcut failed")
+        except Exception:
+            logging.exception("transcribe/paste failed")
+            self.notify("Dictation failed", "See my-whisper.log")
+        finally:
+            with self.lock:
+                self.processing = False
+
+    def clean_text(self, text):
+        text = (text or "").strip()
+        for prefix in ("[BLANK_AUDIO]", "(silence)", "[Silence]"):
+            if text == prefix:
+                return ""
+        return text
+
+    def write_last_text(self, text):
+        path = os.path.join(self.runtime_dir, "last.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def append_history(self, item):
+        with self.lock:
+            os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
+            with open(self.history_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            self.trim_history_locked()
+
+    def trim_history_locked(self):
+        limit = int(self.cfg.get("history_limit", 200))
+        if limit <= 0 or not os.path.exists(self.history_path):
+            return
+        with open(self.history_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= limit:
+            return
+        with open(self.history_path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-limit:])
+
+    def read_history(self, limit=5):
+        if not os.path.exists(self.history_path):
+            return []
+        with self.lock:
+            with open(self.history_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        items = []
+        for line in lines[-max(1, int(limit)):]:
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return list(reversed(items))
+
+    def history_text_by_id(self, item_id):
+        for item in self.read_history(int(self.cfg.get("history_limit", 200))):
+            if item.get("id") == item_id:
+                return item.get("text", "")
+        return ""
+
+    def copy_to_clipboard(self, text):
+        wl_copy = shutil.which("wl-copy")
+        if not wl_copy:
+            logging.error("wl-copy not found")
+            return False
+        result = subprocess.run([wl_copy], input=text.encode("utf-8"), check=False)
+        return result.returncode == 0
+
+    def get_custom_words(self):
+        with self.lock:
+            return list(self.cfg.get("custom_words", []))
+
+    def add_custom_words(self, words):
+        if isinstance(words, str):
+            candidates = [w.strip() for w in words.replace("\n", ",").split(",")]
+        else:
+            candidates = [str(w).strip() for w in words]
+        candidates = [w for w in candidates if w]
+        if not candidates:
+            return {"ok": False, "error": "no words provided"}
+
+        with self.lock:
+            cfg = self.load_config()
+            current = list(cfg.get("custom_words", []))
+            existing = {w.casefold() for w in current}
+            added = []
+            for word in candidates:
+                key = word.casefold()
+                if key in existing:
+                    continue
+                current.append(word)
+                existing.add(key)
+                added.append(word)
+            if added:
+                cfg["custom_words"] = current
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
+                self.cfg = cfg
+                self.history_path = self.cfg.get("history_path", self.history_path)
+                logging.info("custom words added: %s", added)
+        return {"ok": True, "added": added, "words": self.get_custom_words(), "restart_required": False}
+
+    def reload_config(self):
+        with self.lock:
+            self.cfg = self.load_config()
+            self.history_path = self.cfg.get("history_path", self.history_path)
+            self.cue_paths = self.prepare_audio_cues()
+            logging.info("config reloaded")
+
+    def transcribe(self, audio_path, language):
+        self.ensure_whisper_server()
+        host = self.cfg["whisper_host"]
+        port = int(self.cfg["whisper_port"])
+        url = f"http://{host}:{port}/inference"
+        prompt = self.build_prompt(language)
+
+        fields = {
+            "response-format": "json",
+            "language": language,
+            "prompt": prompt,
+        }
+        body, content_type = self.multipart_body(fields, "file", audio_path)
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": content_type})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            payload = resp.read().decode("utf-8", errors="replace")
+        with self.lock:
+            self.last_server_use = time.time()
+
+        try:
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                return str(parsed.get("text") or parsed.get("transcription") or "").strip()
+            return str(parsed).strip()
+        except json.JSONDecodeError:
+            return payload.strip()
+
+    def build_prompt(self, language):
+        language_prompt = self.cfg.get("language_prompts", {}).get(language, "")
+        words = ", ".join(self.cfg.get("custom_words", []))
+        return (
+            f"{language_prompt}\n"
+            f"The transcript may contain these exact project words and names: {words}."
+        ).strip()
+
+    def multipart_body(self, fields, file_field, file_path):
+        boundary = "----mywhisper-" + uuid.uuid4().hex
+        chunks = []
+        for name, value in fields.items():
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+            chunks.append(str(value).encode("utf-8"))
+            chunks.append(b"\r\n")
+
+        filename = os.path.basename(file_path)
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(
+            f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+            "Content-Type: audio/wav\r\n\r\n".encode("utf-8")
+        )
+        with open(file_path, "rb") as f:
+            chunks.append(f.read())
+        chunks.append(b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+    def ensure_whisper_server(self):
+        with self.lock:
+            if self.server_proc and self.server_proc.poll() is None and self.port_open():
+                self.last_server_use = time.time()
+                return
+            if self.port_open():
+                logging.info("using existing whisper server on configured port")
+                self.last_server_use = time.time()
+                return
+
+            model_name = self.cfg["default_model"]
+            model_path = self.cfg["models"][model_name]
+            binary = self.cfg["whisper_server_binary"]
+            if not os.path.exists(binary):
+                raise RuntimeError(f"missing whisper server binary: {binary}")
+            if not os.path.exists(model_path):
+                raise RuntimeError(f"missing whisper model: {model_path}")
+
+            command = [
+                binary,
+                "--model",
+                model_path,
+                "--host",
+                self.cfg["whisper_host"],
+                "--port",
+                str(self.cfg["whisper_port"]),
+                "--language",
+                "auto",
+            ]
+            log = open(self.server_log_path, "ab", buffering=0)
+            logging.info("starting whisper server model=%s command=%s", model_name, command)
+            self.server_proc = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                stdout=log,
+                stderr=log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.server_started_by_us = True
+
+        deadline = time.time() + float(self.cfg["whisper_startup_timeout_seconds"])
+        while time.time() < deadline:
+            if self.server_proc and self.server_proc.poll() is not None:
+                raise RuntimeError(f"whisper server exited with code {self.server_proc.returncode}")
+            if self.port_open():
+                with self.lock:
+                    self.last_server_use = time.time()
+                logging.info("whisper server ready")
+                return
+            time.sleep(0.2)
+        raise RuntimeError("timed out waiting for whisper server")
+
+    def whisper_idle_watchdog(self):
+        idle_seconds = float(self.cfg.get("whisper_idle_shutdown_seconds", 0))
+        if idle_seconds <= 0:
+            return
+        while not self.shutdown_event.is_set():
+            with self.lock:
+                proc = self.server_proc
+                can_stop = (
+                    self.server_started_by_us
+                    and proc
+                    and proc.poll() is None
+                    and not self.recording
+                    and not self.processing
+                    and self.last_server_use
+                    and time.time() - self.last_server_use > idle_seconds
+                )
+            if can_stop:
+                logging.info("stopping idle whisper server after %.0fs", idle_seconds)
+                self.stop_whisper_server()
+            time.sleep(5.0)
+
+    def stop_whisper_server(self):
+        with self.lock:
+            proc = self.server_proc
+            if not proc or proc.poll() is not None:
+                self.server_proc = None
+                self.server_started_by_us = False
+                return
+            self.server_proc = None
+            self.server_started_by_us = False
+
+        try:
+            proc.terminate()
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        except ProcessLookupError:
+            pass
+
+    def port_open(self):
+        try:
+            with socket.create_connection((self.cfg["whisper_host"], int(self.cfg["whisper_port"])), timeout=0.2):
+                return True
+        except OSError:
+            return False
+
+    def paste_text(self, text):
+        wl_copy = shutil.which("wl-copy")
+        ydotool = shutil.which("ydotool")
+        if not wl_copy:
+            logging.error("wl-copy not found")
+            return False
+        subprocess.run([wl_copy], input=text.encode("utf-8"), check=True)
+
+        if not ydotool:
+            logging.error("ydotool not found; clipboard populated only")
+            return False
+
+        time.sleep(float(self.cfg["paste_delay_seconds"]))
+        env = os.environ.copy()
+        if self.cfg.get("ydotool_socket"):
+            env["YDOTOOL_SOCKET"] = self.cfg["ydotool_socket"]
+        result = subprocess.run(
+            [ydotool, "key", *self.cfg["paste_key_sequence"]],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            logging.error("ydotool paste failed: %s", result.stderr.decode("utf-8", errors="replace").strip())
+            return False
+        return True
+
+    def input_event_loop(self):
+        selector = selectors.DefaultSelector()
+        devices = {}
+        last_refresh = 0.0
+
+        while not self.shutdown_event.is_set():
+            now = time.time()
+            if now - last_refresh > 5.0:
+                self.refresh_input_devices(selector, devices)
+                last_refresh = now
+
+            for key, _ in selector.select(timeout=0.25):
+                fd = key.fd
+                try:
+                    data = os.read(fd, EVENT_STRUCT.size * 64)
+                except BlockingIOError:
+                    continue
+                except OSError as e:
+                    if e.errno in (errno.ENODEV, errno.EIO, errno.EBADF):
+                        self.close_device(selector, devices, fd)
+                        continue
+                    raise
+
+                for offset in range(0, len(data) - EVENT_STRUCT.size + 1, EVENT_STRUCT.size):
+                    _, _, event_type, code, value = EVENT_STRUCT.unpack_from(data, offset)
+                    if event_type == EV_KEY and value == KEY_VALUE_RELEASE:
+                        self.handle_key_release(code)
+
+        for fd in list(devices):
+            self.close_device(selector, devices, fd)
+
+    def refresh_input_devices(self, selector, devices):
+        try:
+            names = [n for n in os.listdir("/dev/input") if n.startswith("event")]
+        except FileNotFoundError:
+            return
+
+        known_paths = {info["path"] for info in devices.values()}
+        ignored = set(self.cfg.get("ignored_input_device_names", []))
+        for name in sorted(names):
+            path = os.path.join("/dev/input", name)
+            if path in known_paths:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                device_name = self.input_device_name(fd)
+                if device_name in ignored:
+                    os.close(fd)
+                    continue
+                selector.register(fd, selectors.EVENT_READ)
+                devices[fd] = {"path": path, "name": device_name}
+                logging.info("watching input device %s %r", path, device_name)
+            except PermissionError:
+                logging.warning("no permission to read %s", path)
+            except OSError as e:
+                logging.debug("cannot open %s: %s", path, e)
+
+    def close_device(self, selector, devices, fd):
+        try:
+            selector.unregister(fd)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        devices.pop(fd, None)
+
+    def input_device_name(self, fd):
+        buf = bytearray(256)
+        try:
+            fcntl.ioctl(fd, ev_ioctl_name(len(buf)), buf, True)
+            return buf.split(b"\0", 1)[0].decode("utf-8", errors="replace")
+        except OSError:
+            return "unknown"
+
+    def handle_key_release(self, code):
+        with self.lock:
+            if not self.recording:
+                return
+            trigger = self.recording["trigger"]
+            hotkey = self.cfg["hotkeys"].get(trigger, {})
+            stop_codes = set(hotkey.get("stop_on_release_codes", []))
+        if code in stop_codes:
+            logging.info("release detected trigger=%s code=%s", trigger, code)
+            self.stop_recording(f"release-{trigger}-{code}")
+
+    def maximum_recording_watchdog(self):
+        max_seconds = float(self.cfg["maximum_recording_seconds"])
+        while not self.shutdown_event.is_set():
+            with self.lock:
+                rec = self.recording
+            if rec and time.time() - rec["started_at"] > max_seconds:
+                logging.warning("maximum recording length reached")
+                self.stop_recording("max-duration")
+            time.sleep(0.5)
+
+    def cleanup(self):
+        with self.lock:
+            proc = self.record_proc
+            self.record_proc = None
+            self.recording = None
+            server_proc = self.server_proc if self.server_started_by_us else None
+            self.server_proc = None
+            httpds = list(self.httpds)
+            self.httpds = []
+
+        self.stop_recorder_process(proc)
+        for httpd in httpds:
+            httpd.shutdown()
+        if server_proc and server_proc.poll() is None:
+            try:
+                server_proc.terminate()
+                server_proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                server_proc.kill()
+
+
+def main():
+    daemon = MyWhisperDaemon()
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        daemon.shutdown_event.set()
+        daemon.cleanup()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+logs/
+recordings/
+config.json
+*.local.json
+systemd/my-whisper.service
+*.pyc
+__pycache__/
+.pytest_cache/

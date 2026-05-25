@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+service_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+service_path="$service_dir/my-whisper.service"
+
+mkdir -p "$service_dir"
+
+if [[ ! -f "$root/config.json" ]]; then
+  cp "$root/config.example.json" "$root/config.json"
+  echo "Created $root/config.json. Edit model and binary paths before first use."
+fi
+
+cat >"$service_path" <<SERVICE
+[Unit]
+Description=MyWhispr hold-to-record dictation daemon
+After=pipewire.service wireplumber.service ydotool.service
+Wants=ydotool.service
+
+[Service]
+Type=simple
+WorkingDirectory=$root
+ExecStart=$root/bin/my-whisper-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+chmod 755 "$root/bin/my-whisper-daemon" "$root/bin/my-whisper-client"
+systemctl --user daemon-reload
+systemctl --user enable --now my-whisper.service
+
+echo "Installed my-whisper.service"
+echo "Open http://127.0.0.1:16666/"

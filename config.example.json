@@ -1,0 +1,92 @@
+{
+  "name": "MyWhispr",
+  "socket_path": "/run/user/1000/my-whisper.sock",
+  "runtime_dir": "/run/user/1000/my-whisper",
+  "log_dir": "./logs",
+  "history_path": "./logs/history.jsonl",
+  "history_limit": 200,
+  "web": {
+    "host": "127.0.0.1",
+    "port": 16666
+  },
+  "notifications_enabled": false,
+  "default_model": "large",
+  "models": {
+    "large": "/path/to/ggml-large-v3.bin",
+    "turbo": "/path/to/ggml-large-v3-turbo.bin",
+    "small": "/path/to/ggml-small.bin"
+  },
+  "whisper_server_binary": "/path/to/whisper-server-linux-x64-cuda",
+  "whisper_host": "127.0.0.1",
+  "whisper_port": 18178,
+  "whisper_startup_timeout_seconds": 180,
+  "whisper_idle_shutdown_seconds": 300,
+  "record_command": [
+    "pw-record",
+    "--target",
+    "@DEFAULT_AUDIO_SOURCE@",
+    "--channels",
+    "1",
+    "--rate",
+    "16000",
+    "--format",
+    "s16",
+    "--container",
+    "wav"
+  ],
+  "minimum_recording_seconds": 0.25,
+  "maximum_recording_seconds": 90,
+  "start_cooldown_seconds": 0.75,
+  "audio_cues": {
+    "enabled": true,
+    "player_command": "pw-play",
+    "sample_rate": 44100,
+    "tone_seconds": 0.09,
+    "gap_seconds": 0.025,
+    "attack_seconds": 0.015,
+    "gain": 0.2,
+    "floor_gain": 0.0001,
+    "start_frequencies": [523.25, 659.25],
+    "stop_frequencies": [587.33, 440.0]
+  },
+  "paste_delay_seconds": 0.08,
+  "ydotool_socket": "/run/user/1000/.ydotool_socket",
+  "paste_key_sequence": [
+    "29:1",
+    "42:1",
+    "47:1",
+    "47:0",
+    "42:0",
+    "29:0"
+  ],
+  "hotkeys": {
+    "grave": {
+      "language": "en",
+      "stop_on_release_codes": [41]
+    },
+    "ctrlgrave": {
+      "language": "uk",
+      "stop_on_release_codes": [41, 29, 97]
+    }
+  },
+  "language_labels": {
+    "en": "English",
+    "uk": "Ukrainian",
+    "auto": "Auto"
+  },
+  "language_prompts": {
+    "en": "English dictation. Use English spelling and punctuation.",
+    "uk": "Українська диктовка. Пиши українською мовою, українським правописом. Якщо мовлення змішане з російською, віддавай перевагу стандартним українським словам і формулюванням.",
+    "auto": "Multilingual dictation. Preserve the spoken language."
+  },
+  "ignored_input_device_names": [
+    "ydotoold virtual device"
+  ],
+  "custom_words": [
+    "OpenWhispr",
+    "LLAMA.CPP",
+    "QWEN",
+    "Svelte",
+    "Markdown"
+  ]
+}
