@@ -1,0 +1,7 @@
+{
+  "uuid": "mywhispr@local",
+  "name": "MyWhispr",
+  "description": "Top-bar indicator for MyWhispr dictation daemon",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "local"
+}

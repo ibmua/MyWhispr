@@ -1,0 +1,22 @@
+.mywhispr-label {
+  margin-left: 6px;
+  color: #cccccc;
+}
+
+.mywhispr-recording {
+  color: #ff4f4f;
+}
+
+.mywhispr-busy {
+  color: #f0b400;
+}
+
+.mywhispr-error {
+  color: #ff6b6b;
+}
+
+.mywhispr-popup-text {
+  padding: 6px 8px;
+  font-family: monospace;
+  max-width: 28em;
+}

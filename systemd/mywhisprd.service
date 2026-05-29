@@ -1,0 +1,18 @@
+[Unit]
+Description=MyWhispr dictation daemon
+After=graphical-session.target pipewire.service ydotool.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@PROJECT_DIR@/bin/mywhisprd
+WorkingDirectory=@PROJECT_DIR@
+Environment=MYWHISPR_CONFIG=@PROJECT_DIR@/config.json
+Environment=YDOTOOL_SOCKET=/run/user/%U/.ydotool_socket
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

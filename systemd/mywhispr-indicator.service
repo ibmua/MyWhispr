@@ -1,0 +1,16 @@
+[Unit]
+Description=MyWhispr top-bar indicator
+After=graphical-session.target mywhisprd.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@PROJECT_DIR@/bin/mywhispr-indicator
+WorkingDirectory=@PROJECT_DIR@
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,92 +1,87 @@
 {
-  "name": "MyWhispr",
-  "socket_path": "/run/user/1000/my-whisper.sock",
-  "runtime_dir": "/run/user/1000/my-whisper",
-  "log_dir": "./logs",
-  "history_path": "./logs/history.jsonl",
-  "history_limit": 200,
-  "web": {
-    "host": "127.0.0.1",
-    "port": 16666
-  },
-  "notifications_enabled": false,
-  "default_model": "large",
+  "default_model": "large-q5",
+  "preload_default_model_on_startup": true,
+  "gpu_asr_python": "./.venv-gpu-asr/bin/python",
   "models": {
-    "large": "/path/to/ggml-large-v3.bin",
-    "turbo": "/path/to/ggml-large-v3-turbo.bin",
-    "small": "/path/to/ggml-small.bin"
+    "large-q5": {
+      "backend": "whisper.cpp",
+      "path": "./models/ggml-large-v3-q5_0.bin",
+      "label": "Whisper Large v3 Q5",
+      "description": "Primary default",
+      "subdescription": "Best accuracy"
+    },
+    "parakeet-tdt-0.6b-v3": {
+      "backend": "transformers_tdt",
+      "repo_id": "nvidia/parakeet-tdt-0.6b-v3",
+      "device": "cuda:0",
+      "dtype": "auto",
+      "local_files_only": true,
+      "live_preview": true,
+      "label": "Parakeet TDT 0.6B v3",
+      "description": "Fast secondary",
+      "subdescription": "NVIDIA TDT"
+    },
+    "turbo": {
+      "backend": "whisper.cpp",
+      "path": "./models/ggml-large-v3-turbo.bin",
+      "label": "Whisper Large v3 Turbo",
+      "description": "Fast fallback",
+      "subdescription": "Turbo"
+    },
+    "large": {
+      "backend": "whisper.cpp",
+      "path": "./models/ggml-large-v3.bin",
+      "label": "Whisper Large v3",
+      "description": "Full precision",
+      "subdescription": "Reference"
+    },
+    "small": {
+      "backend": "whisper.cpp",
+      "path": "./models/ggml-small.bin",
+      "label": "Whisper Small",
+      "description": "Lightweight",
+      "subdescription": "Fallback"
+    },
+    "qwen3-asr-1.7b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-1.7B", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
+    "granite-speech-4.1-2b": {"backend": "transformers_speech_seq2seq", "repo_id": "ibm-granite/granite-speech-4.1-2b", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
+    "cohere-transcribe-03-2026": {"backend": "cohere_asr", "repo_id": "CohereLabs/cohere-transcribe-03-2026", "device": "cuda:0", "dtype": "auto", "local_files_only": true, "trust_remote_code": false, "live_preview": true},
+    "canary-qwen-2.5b": {"backend": "nemo_salm", "repo_id": "nvidia/canary-qwen-2.5b", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
+    "canary-1b-v2": {"backend": "nemo_asr", "repo_id": "nvidia/canary-1b-v2", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true, "nemo_language_kwargs": true},
+    "seamless-m4t-v2-large": {"backend": "seamless_m4t_v2", "repo_id": "facebook/seamless-m4t-v2-large", "device": "cuda:0", "dtype": "float16", "local_files_only": true, "live_preview": true},
+    "qwen3-asr-0.6b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-0.6B", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true}
   },
   "whisper_server_binary": "/path/to/whisper-server-linux-x64-cuda",
   "whisper_host": "127.0.0.1",
   "whisper_port": 18178,
-  "whisper_startup_timeout_seconds": 180,
-  "whisper_idle_shutdown_seconds": 300,
-  "record_command": [
-    "pw-record",
-    "--target",
-    "@DEFAULT_AUDIO_SOURCE@",
-    "--channels",
-    "1",
-    "--rate",
-    "16000",
-    "--format",
-    "s16",
-    "--container",
-    "wav"
-  ],
-  "minimum_recording_seconds": 0.25,
-  "maximum_recording_seconds": 90,
-  "start_cooldown_seconds": 0.75,
-  "audio_cues": {
-    "enabled": true,
-    "player_command": "pw-play",
-    "sample_rate": 44100,
-    "tone_seconds": 0.09,
-    "gap_seconds": 0.025,
-    "attack_seconds": 0.015,
-    "gain": 0.2,
-    "floor_gain": 0.0001,
-    "start_frequencies": [523.25, 659.25],
-    "stop_frequencies": [587.33, 440.0]
+  "whisper_idle_shutdown_seconds": 0,
+  "web": {"host": "127.0.0.1", "port": 16666},
+  "history_limit": 20,
+  "start_cooldown_seconds": 0.2,
+  "audio_cues": {"enabled": true, "volume": 0.85},
+  "streaming": {
+    "app_output_enabled": true,
+    "interval_seconds": 0.8,
+    "initial_delay_seconds": 1.2,
+    "stable_lag_seconds": 0.65,
+    "max_rewrite_chars": 180,
+    "initial_commit_confirmations": 2,
+    "rewrite_backspace_confirmations": 2
   },
-  "paste_delay_seconds": 0.08,
-  "ydotool_socket": "/run/user/1000/.ydotool_socket",
-  "paste_key_sequence": [
-    "29:1",
-    "42:1",
-    "47:1",
-    "47:0",
-    "42:0",
-    "29:0"
-  ],
-  "hotkeys": {
+  "triggers": {
     "grave": {
-      "language": "en",
-      "stop_on_release_codes": [41]
-    },
-    "ctrlgrave": {
+      "binding": "grave",
       "language": "uk",
-      "stop_on_release_codes": [41, 29, 97]
+      "stop_on_release_codes": [41],
+      "combo": {
+        "enabled": true,
+        "hold_grab_until_release": true,
+        "deadline_seconds": 1.2,
+        "keys": [{"code": 2, "type": "language", "language": "en", "short_mode": "en", "switch_language": "en"}]
+      }
     }
   },
-  "language_labels": {
-    "en": "English",
-    "uk": "Ukrainian",
-    "auto": "Auto"
-  },
-  "language_prompts": {
-    "en": "English dictation. Use English spelling and punctuation.",
-    "uk": "Українська диктовка. Пиши українською мовою, українським правописом. Якщо мовлення змішане з російською, віддавай перевагу стандартним українським словам і формулюванням.",
-    "auto": "Multilingual dictation. Preserve the spoken language."
-  },
-  "ignored_input_device_names": [
-    "ydotoold virtual device"
-  ],
-  "custom_words": [
-    "OpenWhispr",
-    "LLAMA.CPP",
-    "QWEN",
-    "Svelte",
-    "Markdown"
-  ]
+  "input_grab": {
+    "device_name_patterns": ["keyboard"],
+    "exclude_device_name_patterns": ["ydotoold virtual device"]
+  }
 }

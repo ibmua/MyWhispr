@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Thin Unix-socket client. One JSON line in, one JSON line out."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+def _socket_path() -> Path:
+    env = os.environ.get("MYWHISPR_SOCKET")
+    if env:
+        return Path(env)
+    uid = os.getuid()
+    return Path(f"/run/user/{uid}/mywhispr.sock")
+
+
+def _send(req: dict, timeout: float = 2.0) -> dict:
+    path = _socket_path()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(path))
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        return {"ok": False, "reason": f"socket_unreachable: {e}"}
+    try:
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0]
+        try:
+            return json.loads(line.decode("utf-8"))
+        except Exception as e:
+            return {"ok": False, "reason": f"invalid_response: {e}", "raw": line.decode("utf-8", "replace")}
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="mywhisprctl")
+    p.add_argument("--timeout", type=float, default=None, help="socket timeout in seconds")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s_start = sub.add_parser("start")
+    s_start.add_argument("trigger", nargs="?", default="grave")
+    sub.add_parser("stop")
+    sub.add_parser("status")
+    s_warm = sub.add_parser("warm")
+    s_warm.add_argument("model", nargs="?", default=None)
+    sub.add_parser("unload")
+    args = p.parse_args()
+
+    if args.cmd == "start":
+        req = {"cmd": "start", "trigger": args.trigger}
+    elif args.cmd == "stop":
+        req = {"cmd": "stop"}
+    elif args.cmd == "status":
+        req = {"cmd": "status"}
+    elif args.cmd == "warm":
+        req = {"cmd": "warm"}
+        if args.model:
+            req["model"] = args.model
+    elif args.cmd == "unload":
+        req = {"cmd": "unload"}
+    else:
+        return 2
+
+    timeout = args.timeout
+    if timeout is None:
+        timeout = 240.0 if args.cmd == "warm" else 10.0 if args.cmd == "unload" else 2.0
+
+    resp = _send(req, timeout=timeout)
+    print(json.dumps(resp, ensure_ascii=False))
+    return 0 if resp.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import subprocess
+import urllib.error
+import urllib.request
+
+import gi
+
+gi.require_version("AyatanaAppIndicator3", "0.1")
+gi.require_version("Gtk", "3.0")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import GLib, Gtk
+
+
+STATUS_URL = "http://127.0.0.1:16666/api/status"
+STOP_URL = "http://127.0.0.1:16666/api/recording/stop"
+WEB_URL = "http://127.0.0.1:16666/"
+POLL_MS = 600
+
+
+def fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
+    with urllib.request.urlopen(req, timeout=1.5) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def post_json(url: str, body: dict | None = None) -> None:
+    data = json.dumps(body or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=1.5):
+        pass
+
+
+def mode_marker(status: dict) -> str:
+    if (status.get("current_mode_type") or "") == "script":
+        return "script"
+    lang = status.get("current_language") or ""
+    if lang:
+        return lang.upper()
+    return ""
+
+
+def truncate_words(text: str, max_words: int) -> str:
+    words = text.strip().split()
+    if not words:
+        return ""
+    if len(words) <= max_words:
+        return " ".join(words)
+    return "..." + " ".join(words[-max_words:])
+
+
+def label_for_status(status: dict) -> tuple[str, str, str]:
+    topbar = status.get("topbar") or {}
+    state = status.get("state") or "IDLE"
+    max_words = int(topbar.get("max_words") or 10)
+    if max_words < 1:
+        max_words = 1
+
+    if topbar.get("enabled") is False:
+        return "disabled", "audio-input-microphone-symbolic", "disabled"
+
+    if state in {"RECORDING", "STARTING"}:
+        marker = mode_marker(status)
+        text = truncate_words(status.get("live_preview") or "", max_words)
+        label = "REC"
+        if marker:
+            label += f" {marker}"
+        if text:
+            label += f" {text}"
+        return label, "media-record-symbolic", "recording"
+
+    if state in {"STOPPING", "STOPPING_NO_PASTE", "TRANSCRIBING", "TRANSCRIBING_NO_PASTE"}:
+        return "transcribing", "audio-input-microphone-symbolic", "busy"
+
+    if state == "PASTING":
+        return "pasting", "audio-input-microphone-symbolic", "busy"
+
+    retranslate = status.get("retranslate") or {}
+    if retranslate.get("active"):
+        done = retranslate.get("done") or 0
+        total = retranslate.get("total") or 0
+        return f"retr {done}/{total}", "audio-input-microphone-symbolic", "busy"
+
+    if topbar.get("show_when_idle") is not False:
+        text = truncate_words(status.get("last_transcript") or "", max_words)
+        if text:
+            return text, "audio-input-microphone-symbolic", "idle"
+
+    return "idle", "audio-input-microphone-symbolic", "idle"
+
+
+class MyWhisprIndicator:
+    def __init__(self) -> None:
+        self.last_text = ""
+        self.indicator = AppIndicator.Indicator.new(
+            "mywhispr-indicator",
+            "audio-input-microphone-symbolic",
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_label("MyWhispr", "MyWhispr")
+        self.indicator.set_menu(self._build_menu())
+        GLib.timeout_add(POLL_MS, self._tick)
+        self._tick()
+
+    def _build_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="MyWhispr: starting")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+
+        self.last_item = Gtk.MenuItem(label="No transcript yet")
+        self.last_item.set_sensitive(False)
+        menu.append(self.last_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        copy_item = Gtk.MenuItem(label="Copy last transcript")
+        copy_item.connect("activate", self._copy_last)
+        menu.append(copy_item)
+
+        self.stop_item = Gtk.MenuItem(label="Stop recording")
+        self.stop_item.connect("activate", self._stop_recording)
+        menu.append(self.stop_item)
+
+        open_item = Gtk.MenuItem(label="Open web UI")
+        open_item.connect("activate", self._open_ui)
+        menu.append(open_item)
+
+        menu.show_all()
+        return menu
+
+    def _tick(self) -> bool:
+        try:
+            status = fetch_json(STATUS_URL)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            self.indicator.set_icon("microphone-disabled-symbolic")
+            self.indicator.set_label("MyWhispr offline", "MyWhispr offline")
+            self.status_item.set_label("MyWhispr: offline")
+            self.stop_item.set_sensitive(False)
+            return True
+
+        label, icon, tone = label_for_status(status)
+        self.indicator.set_icon(icon)
+        self.indicator.set_label(label, label)
+        self.status_item.set_label(f"MyWhispr: {status.get('state', 'unknown').lower()}")
+        self.last_text = status.get("last_transcript") or ""
+        self.last_item.set_label(self.last_text or "No transcript yet")
+        self.stop_item.set_sensitive(status.get("state") in {"RECORDING", "STARTING"})
+
+        if tone == "recording":
+            self.indicator.set_status(AppIndicator.IndicatorStatus.ATTENTION)
+        else:
+            self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        return True
+
+    def _copy_last(self, _item: Gtk.MenuItem) -> None:
+        if not self.last_text:
+            return
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)  # type: ignore[name-defined]
+        clipboard.set_text(self.last_text, -1)
+        clipboard.store()
+
+    def _stop_recording(self, _item: Gtk.MenuItem) -> None:
+        try:
+            post_json(STOP_URL)
+        except Exception:
+            pass
+
+    def _open_ui(self, _item: Gtk.MenuItem) -> None:
+        subprocess.Popen(["xdg-open", WEB_URL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    from gi.repository import Gdk
+
+    MyWhisprIndicator()
+    Gtk.main()
