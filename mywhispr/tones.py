@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 def _tone_wav(path: Path, freq: float, duration_s: float, *, volume: float = 0.25) -> None:
     sr = 44100
     n = int(sr * duration_s)
-    fade = max(1, int(sr * 0.01))
+    fade = max(1, min(int(sr * 0.004), n // 4))
     frames = bytearray()
     for i in range(n):
         env = 1.0
@@ -51,7 +51,7 @@ class Tones:
 
     def _ensure(self) -> None:
         # Regenerate on startup/config change so cue timing/volume applies immediately.
-        _tone_wav(self.start, 1040.0, 0.18, volume=0.65 * self.volume)
+        _tone_wav(self.start, 1040.0, 0.035, volume=0.50 * self.volume)
         _tone_wav(self.stop, 660.0, 0.12, volume=0.45 * self.volume)
         _tone_wav(self.error, 220.0, 0.20, volume=0.55 * self.volume)
 

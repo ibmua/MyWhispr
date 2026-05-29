@@ -125,7 +125,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "device_name_patterns": [],
         "exclude_device_name_patterns": ["ydotoold virtual device"],
     },
-    "audio_cues": {"enabled": True, "volume": 0.85},
+    "audio_cues": {"enabled": True, "volume": 0.85, "start_recording_delay_seconds": 0.08},
     "custom_words": [],
     "language_prompts": {
         "uk": (
@@ -262,6 +262,13 @@ def _validate(cfg: dict) -> None:
     if not 0.0 <= volume <= 1.0:
         log.warning("audio_cues.volume %s outside [0.0, 1.0]; clamping", volume)
         audio_cues["volume"] = max(0.0, min(1.0, volume))
+    start_delay = float(audio_cues.get("start_recording_delay_seconds", 0.08))
+    if not 0.0 <= start_delay <= 0.25:
+        log.warning(
+            "audio_cues.start_recording_delay_seconds %s outside [0.0, 0.25]; clamping",
+            start_delay,
+        )
+        audio_cues["start_recording_delay_seconds"] = max(0.0, min(0.25, start_delay))
 
 
 def atomic_write_json(path: Path, data: dict) -> None:

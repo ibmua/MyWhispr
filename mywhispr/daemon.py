@@ -889,6 +889,14 @@ async def _start_recording_effect(d: Daemon, trigger: str) -> None:
     def _on_unexpected_exit():
         d.post(Event.RECORDER_EXITED_ERROR)
 
+    if d.tones.enabled:
+        delay = float(d.config.get("audio_cues.start_recording_delay_seconds", 0.08))
+        if delay > 0:
+            await asyncio.sleep(delay)
+    if d._release_requested_while_starting or d.state == State.STOPPING:
+        d.post(Event.RECORDER_STOPPED)
+        return
+
     ok = await d.recorder.start(on_unexpected_exit=_on_unexpected_exit)
     if not ok:
         d.post(Event.RECORDER_FAILED)

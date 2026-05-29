@@ -57,7 +57,7 @@
   "web": {"host": "127.0.0.1", "port": 16666},
   "history_limit": 20,
   "start_cooldown_seconds": 0.2,
-  "audio_cues": {"enabled": true, "volume": 0.85},
+  "audio_cues": {"enabled": true, "volume": 0.85, "start_recording_delay_seconds": 0.08},
   "streaming": {
     "app_output_enabled": true,
     "interval_seconds": 0.8,
