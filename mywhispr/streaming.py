@@ -132,6 +132,8 @@ class StreamingSession:
             new="",
             settle_seconds=float(self.config.get("clipboard_settle_seconds", 0.03)),
             max_rewrite_chars=max_rewrite,
+            consume_timeout=float(self.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+            key_delay_ms=int(self.config.get("paste_key_delay_ms", 18)),
         )
         if ok:
             self.committed_text = ""
@@ -309,6 +311,11 @@ class StreamingSession:
             new=stable,
             settle_seconds=float(self.config.get("clipboard_settle_seconds", 0.03)),
             max_rewrite_chars=max_rewrite,
+            consume_timeout=float(self.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+            key_delay_ms=int(self.config.get("paste_key_delay_ms", 18)),
+            type_key_delay_ms=int(self.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
+            direct_type_max_chars=int(self.config.get("direct_type_max_chars", 240)),
+            direct_type_ascii_only=bool(self.config.get("direct_type_ascii_only", True)),
         )
         if not ok:
             log.warning("stream rewrite refused; leaving committed text untouched")

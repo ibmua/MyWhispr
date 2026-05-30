@@ -1275,6 +1275,11 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
     streaming_committed = ""
     if d._stream is not None:
         streaming_committed = d._stream.committed_text
+    type_kwargs = {
+        "type_key_delay_ms": int(d.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
+        "direct_type_max_chars": int(d.config.get("direct_type_max_chars", 240)),
+        "direct_type_ascii_only": bool(d.config.get("direct_type_ascii_only", True)),
+    }
     if streaming_committed:
         max_rewrite = int((d.config.get("streaming") or {}).get("max_rewrite_chars", 180))
         diverge = d._stream.divergence_from_final(text) if d._stream else 0
@@ -1282,7 +1287,7 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
             # Refuse destructive rewrite; leave clipboard with full text, no paste.
             log.warning("final divergence %d > %d; refusing rewrite", diverge, max_rewrite)
             # Stash final on clipboard for manual paste.
-            await paste_mod._wl_copy(text, paste_once=False)
+            await paste_mod.copy_text(text)
             d.tones.play_error()
             d.post(Event.PASTE_DONE, item_id=item.id, ok=False)
             return
@@ -1292,6 +1297,9 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
             new=text,
             settle_seconds=float(d.config.get("clipboard_settle_seconds", 0.03)),
             max_rewrite_chars=max_rewrite,
+            consume_timeout=float(d.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+            key_delay_ms=int(d.config.get("paste_key_delay_ms", 18)),
+            **type_kwargs,
         )
         d.post(Event.PASTE_DONE, item_id=item.id, ok=ok)
         return
@@ -1300,6 +1308,8 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
         text,
         settle_seconds=float(d.config.get("clipboard_settle_seconds", 0.03)),
         consume_timeout=float(d.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+        key_delay_ms=int(d.config.get("paste_key_delay_ms", 18)),
+        **type_kwargs,
     )
     d.post(Event.PASTE_DONE, item_id=item.id, ok=ok)
 

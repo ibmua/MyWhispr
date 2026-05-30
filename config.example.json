@@ -57,6 +57,11 @@
   "web": {"host": "127.0.0.1", "port": 16666},
   "history_limit": 20,
   "start_cooldown_seconds": 0.2,
+  "clipboard_paste_consume_timeout_seconds": 0.8,
+  "paste_key_delay_ms": 18,
+  "type_key_delay_ms": 0,
+  "direct_type_max_chars": 240,
+  "direct_type_ascii_only": true,
   "audio_cues": {"enabled": true, "volume": 0.85, "start_recording_delay_seconds": 0.08},
   "streaming": {
     "app_output_enabled": true,

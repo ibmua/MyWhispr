@@ -2,14 +2,120 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import sys
+from typing import Protocol
 
 log = logging.getLogger(__name__)
 
-# Ctrl+Shift+V keycodes for ydotool: 29=LCTRL, 42=LSHIFT, 47=V
+# ydotool keycodes: 29=LCTRL, 42=LSHIFT, 47=V, 110=INSERT, 14=BACKSPACE
 PASTE_CHORD = ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
-# Backspace single press/release: 14=BACKSPACE
+SHIFT_INSERT_CHORD = ["42:1", "110:1", "110:0", "42:0"]
+PASTE_CHORDS = [
+    ("ctrl+shift+v", PASTE_CHORD),
+    ("shift+insert", SHIFT_INSERT_CHORD),
+]
 BACKSPACE_CHORD = ["14:1", "14:0"]
+DEFAULT_PASTE_KEY_DELAY_MS = 18
+DEFAULT_TYPE_KEY_DELAY_MS = 0
+DEFAULT_DIRECT_TYPE_MAX_CHARS = 240
+
+
+class OutputBackend(Protocol):
+    name: str
+
+    async def type_text(self, text: str, *, delay_ms: int) -> bool:
+        ...
+
+    async def paste_text(
+        self,
+        text: str,
+        *,
+        settle_seconds: float,
+        consume_timeout: float,
+        key_delay_ms: int,
+    ) -> bool:
+        ...
+
+    async def copy_text(self, text: str) -> bool:
+        ...
+
+    async def backspace(self, count: int) -> bool:
+        ...
+
+
+class LinuxWaylandYdotoolBackend:
+    name = "linux-wayland-ydotool"
+
+    async def type_text(self, text: str, *, delay_ms: int) -> bool:
+        return await _ydotool_type(text, delay_ms=delay_ms)
+
+    async def paste_text(
+        self,
+        text: str,
+        *,
+        settle_seconds: float,
+        consume_timeout: float,
+        key_delay_ms: int,
+    ) -> bool:
+        return await _wayland_clipboard_paste(
+            text,
+            settle_seconds=settle_seconds,
+            consume_timeout=consume_timeout,
+            key_delay_ms=key_delay_ms,
+        )
+
+    async def copy_text(self, text: str) -> bool:
+        return await _wl_copy(text, paste_once=False)
+
+    async def backspace(self, count: int) -> bool:
+        if count <= 0:
+            return True
+        return await _ydotool_keys(BACKSPACE_CHORD * count, delay_ms=0)
+
+
+class WindowsSendInputBackend:
+    name = "windows-sendinput"
+
+    async def type_text(self, text: str, *, delay_ms: int) -> bool:
+        return await asyncio.to_thread(_windows_type_text, text, delay_ms)
+
+    async def paste_text(
+        self,
+        text: str,
+        *,
+        settle_seconds: float,
+        consume_timeout: float,
+        key_delay_ms: int,
+    ) -> bool:
+        if not await self.copy_text(text):
+            return False
+        await asyncio.sleep(max(settle_seconds, 0.03))
+        return await asyncio.to_thread(_windows_paste, key_delay_ms)
+
+    async def copy_text(self, text: str) -> bool:
+        return await asyncio.to_thread(_windows_copy_text, text)
+
+    async def backspace(self, count: int) -> bool:
+        if count <= 0:
+            return True
+        return await asyncio.to_thread(_windows_backspace, count)
+
+
+_backend: OutputBackend | None = None
+
+
+def output_backend() -> OutputBackend:
+    global _backend
+    if _backend is None:
+        if sys.platform == "win32":
+            _backend = WindowsSendInputBackend()
+        else:
+            _backend = LinuxWaylandYdotoolBackend()
+    return _backend
+
+
+async def copy_text(text: str, *, backend: OutputBackend | None = None) -> bool:
+    return await (backend or output_backend()).copy_text(text)
 
 
 async def _wl_copy(text: str, *, paste_once: bool) -> bool:
@@ -50,16 +156,22 @@ async def _start_wl_copy(text: str, *, paste_once: bool) -> asyncio.subprocess.P
     return proc
 
 
-async def _wait_wl_copy(proc: asyncio.subprocess.Process, *, timeout: float) -> bool:
+async def _wait_wl_copy(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    kill_on_timeout: bool = True,
+) -> bool:
     try:
         rc = await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
-        log.error("wl-copy timed out")
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
+        if kill_on_timeout:
+            log.error("wl-copy timed out")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
         return False
     if rc != 0:
         try:
@@ -69,6 +181,23 @@ async def _wait_wl_copy(proc: asyncio.subprocess.Process, *, timeout: float) -> 
         log.error("wl-copy rc=%s err=%r", rc, err)
         return False
     return True
+
+
+async def _stop_wl_copy(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=0.5)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
 
 
 async def _ydotool_keys(keycodes: list[str], *, delay_ms: int | None = None) -> bool:
@@ -102,17 +231,294 @@ async def _ydotool_keys(keycodes: list[str], *, delay_ms: int | None = None) -> 
     return True
 
 
-async def paste_final(text: str, *, settle_seconds: float, consume_timeout: float) -> bool:
-    if not text:
-        return True
-    if not await _wl_copy(text, paste_once=False):
+async def _ydotool_type(text: str, *, delay_ms: int | None = None) -> bool:
+    args = ["ydotool", "type"]
+    if delay_ms is not None:
+        args.extend(["-d", str(max(0, int(delay_ms)))])
+    args.append(text)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.error("ydotool not found")
         return False
-    await asyncio.sleep(max(settle_seconds, 0.12))
-    keys_ok = await _ydotool_keys(PASTE_CHORD)
-    if not keys_ok:
-        await _wl_copy(text, paste_once=False)
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=max(5.0, len(text) * 0.04))
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False
+    if rc != 0:
+        try:
+            err = await proc.stderr.read(400) if proc.stderr else b""
+        except Exception:
+            err = b""
+        log.error("ydotool type rc=%s err=%r", rc, err)
         return False
     return True
+
+
+async def _wayland_clipboard_paste(
+    text: str,
+    *,
+    settle_seconds: float,
+    consume_timeout: float,
+    key_delay_ms: int,
+) -> bool:
+    proc = await _start_wl_copy(text, paste_once=True)
+    if proc is None:
+        return False
+    await asyncio.sleep(max(settle_seconds, 0.12))
+    for name, chord in PASTE_CHORDS:
+        keys_ok = await _ydotool_keys(chord, delay_ms=key_delay_ms)
+        if not keys_ok:
+            log.warning("paste chord failed chord=%s", name)
+            continue
+        consumed = await _wait_wl_copy(
+            proc,
+            timeout=max(0.05, consume_timeout),
+            kill_on_timeout=False,
+        )
+        if consumed:
+            log.info("output method=paste backend=wayland chord=%s chars=%d", name, len(text))
+            return True
+        if proc.returncode is not None:
+            return False
+        log.warning("paste chord did not consume clipboard chord=%s", name)
+
+    await _stop_wl_copy(proc)
+    await _wl_copy(text, paste_once=False)
+    return False
+
+
+_windows_types: tuple | None = None
+
+
+def _windows_input_types():
+    global _windows_types
+    if _windows_types is not None:
+        return _windows_types
+    import ctypes
+
+    ulong_ptr = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk", ctypes.c_ushort),
+            ("wScan", ctypes.c_ushort),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ulong_ptr),
+        ]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", ctypes.c_long),
+            ("dy", ctypes.c_long),
+            ("mouseData", ctypes.c_ulong),
+            ("dwFlags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ulong_ptr),
+        ]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [
+            ("uMsg", ctypes.c_ulong),
+            ("wParamL", ctypes.c_ushort),
+            ("wParamH", ctypes.c_ushort),
+        ]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("u", INPUT_UNION)]
+
+    _windows_types = (ctypes, KEYBDINPUT, INPUT_UNION, INPUT)
+    return _windows_types
+
+
+def _windows_key_input(vk: int, scan: int, flags: int):
+    ctypes, keybdinput, input_union, input_type = _windows_input_types()
+    return input_type(
+        1,
+        input_union(ki=keybdinput(vk, scan, flags, 0, 0)),
+    )
+
+
+def _windows_send(inputs) -> bool:
+    ctypes, _keybdinput, _input_union, input_type = _windows_input_types()
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (ctypes.c_uint, ctypes.POINTER(input_type), ctypes.c_int)
+    user32.SendInput.restype = ctypes.c_uint
+    sent = user32.SendInput(len(inputs), inputs, ctypes.sizeof(input_type))
+    if sent != len(inputs):
+        log.error("SendInput sent %d/%d events", sent, len(inputs))
+        return False
+    return True
+
+
+def _windows_type_text(text: str, delay_ms: int) -> bool:
+    import time
+
+    ctypes, _keybdinput, _input_union, input_type = _windows_input_types()
+    keyeventf_keyup = 0x0002
+    keyeventf_unicode = 0x0004
+    encoded = text.encode("utf-16-le")
+    units = [int.from_bytes(encoded[i : i + 2], "little") for i in range(0, len(encoded), 2)]
+    for unit in units:
+        inputs = (input_type * 2)(
+            _windows_key_input(0, unit, keyeventf_unicode),
+            _windows_key_input(0, unit, keyeventf_unicode | keyeventf_keyup),
+        )
+        if not _windows_send(inputs):
+            return False
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000)
+    return True
+
+
+def _windows_key_chord(vks: list[int], delay_ms: int) -> bool:
+    import time
+
+    ctypes, _keybdinput, _input_union, input_type = _windows_input_types()
+    keyeventf_keyup = 0x0002
+    events = [_windows_key_input(vk, 0, 0) for vk in vks]
+    events.extend(_windows_key_input(vk, 0, keyeventf_keyup) for vk in reversed(vks))
+    inputs = (input_type * len(events))(*events)
+    ok = _windows_send(inputs)
+    if ok and delay_ms > 0:
+        time.sleep(delay_ms / 1000)
+    return ok
+
+
+def _windows_paste(delay_ms: int) -> bool:
+    return _windows_key_chord([0x11, 0x56], delay_ms)
+
+
+def _windows_backspace(count: int) -> bool:
+    for _ in range(count):
+        if not _windows_key_chord([0x08], 0):
+            return False
+    return True
+
+
+def _windows_copy_text(text: str) -> bool:
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    data = (text + "\0").encode("utf-16-le")
+    gmem_moveable = 0x0002
+    cf_unicode_text = 13
+
+    kernel32.GlobalAlloc.argtypes = (ctypes.c_uint, ctypes.c_size_t)
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+    user32.SetClipboardData.argtypes = (ctypes.c_uint, ctypes.c_void_p)
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    handle = kernel32.GlobalAlloc(gmem_moveable, len(data))
+    if not handle:
+        return False
+    locked = kernel32.GlobalLock(handle)
+    if not locked:
+        kernel32.GlobalFree(handle)
+        return False
+    ctypes.memmove(locked, data, len(data))
+    kernel32.GlobalUnlock(handle)
+
+    if not user32.OpenClipboard(None):
+        kernel32.GlobalFree(handle)
+        return False
+    try:
+        if not user32.EmptyClipboard():
+            return False
+        if not user32.SetClipboardData(cf_unicode_text, handle):
+            return False
+        handle = None
+        return True
+    finally:
+        user32.CloseClipboard()
+        if handle:
+            kernel32.GlobalFree(handle)
+
+
+def should_direct_type(
+    text: str,
+    *,
+    max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
+    ascii_only: bool = True,
+) -> bool:
+    if not text or len(text) > max_chars:
+        return False
+    if any(ch in "\r\n\t" for ch in text):
+        return False
+    if ascii_only:
+        return all(0x20 <= ord(ch) <= 0x7E for ch in text)
+    return all(ord(ch) >= 0x20 for ch in text)
+
+
+async def _paste_text(
+    text: str,
+    *,
+    settle_seconds: float,
+    consume_timeout: float,
+    key_delay_ms: int,
+    type_key_delay_ms: int,
+    direct_type_max_chars: int,
+    direct_type_ascii_only: bool,
+    backend: OutputBackend | None = None,
+) -> bool:
+    if not text:
+        return True
+    out = backend or output_backend()
+    if should_direct_type(
+        text,
+        max_chars=direct_type_max_chars,
+        ascii_only=direct_type_ascii_only,
+    ):
+        typed = await out.type_text(text, delay_ms=type_key_delay_ms)
+        if typed:
+            log.info("output method=type backend=%s chars=%d", out.name, len(text))
+            return True
+        log.warning("direct type failed; falling back to clipboard paste chars=%d", len(text))
+    return await out.paste_text(
+        text,
+        settle_seconds=settle_seconds,
+        consume_timeout=consume_timeout,
+        key_delay_ms=key_delay_ms,
+    )
+
+
+async def paste_final(
+    text: str,
+    *,
+    settle_seconds: float,
+    consume_timeout: float,
+    key_delay_ms: int = DEFAULT_PASTE_KEY_DELAY_MS,
+    type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
+    direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
+    direct_type_ascii_only: bool = True,
+    backend: OutputBackend | None = None,
+) -> bool:
+    return await _paste_text(
+        text,
+        settle_seconds=settle_seconds,
+        consume_timeout=consume_timeout,
+        key_delay_ms=key_delay_ms,
+        type_key_delay_ms=type_key_delay_ms,
+        direct_type_max_chars=direct_type_max_chars,
+        direct_type_ascii_only=direct_type_ascii_only,
+        backend=backend,
+    )
 
 
 async def stream_replace(
@@ -122,11 +528,14 @@ async def stream_replace(
     settle_seconds: float,
     max_rewrite_chars: int,
     consume_timeout: float = 1.5,
+    key_delay_ms: int = DEFAULT_PASTE_KEY_DELAY_MS,
+    type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
+    direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
+    direct_type_ascii_only: bool = True,
+    backend: OutputBackend | None = None,
 ) -> bool:
-    """Backspace common-suffix divergence and paste replacement. Returns False if
-    the rewrite would exceed `max_rewrite_chars`.
-    """
-    # Compute common prefix length.
+    """Backspace common-prefix divergence and append replacement text."""
+    out = backend or output_backend()
     i = 0
     n = min(len(previous), len(new))
     while i < n and previous[i] == new[i]:
@@ -139,16 +548,20 @@ async def stream_replace(
         log.warning("stream rewrite cap hit: %d > %d", backspaces, max_rewrite_chars)
         return False
     if backspaces > 0:
-        chord = BACKSPACE_CHORD * backspaces
-        ok = await _ydotool_keys(chord, delay_ms=0)
+        ok = await out.backspace(backspaces)
         if not ok:
             return False
     if addition:
-        if not await _wl_copy(addition, paste_once=False):
-            return False
-        await asyncio.sleep(max(settle_seconds, 0.12))
-        ok = await _ydotool_keys(PASTE_CHORD)
+        ok = await _paste_text(
+            addition,
+            settle_seconds=settle_seconds,
+            consume_timeout=consume_timeout,
+            key_delay_ms=key_delay_ms,
+            type_key_delay_ms=type_key_delay_ms,
+            direct_type_max_chars=direct_type_max_chars,
+            direct_type_ascii_only=direct_type_ascii_only,
+            backend=out,
+        )
         if not ok:
-            await _wl_copy(addition, paste_once=False)
             return False
     return True

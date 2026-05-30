@@ -403,10 +403,13 @@ The entire feature lives in `streaming.py`. Integration rule: with `streaming.ap
 
 Final output (release path):
 
-- Copy final cleaned text with persistent `wl-copy`.
-- Send the configured paste chord via `ydotool` (`Ctrl+Shift+V` by default; `Ctrl+V` is unsafe in terminals).
+- Short printable ASCII output is typed directly through the synthetic-input backend with zero inter-key delay by default, avoiding focused-app paste filters.
+- Longer or non-ASCII output is pasted through the active output backend; on Wayland that uses `wl-copy --paste-once`.
+- Send paste chords via `ydotool`: first `Ctrl+Shift+V`, then `Shift+Insert` if the clipboard offer was not consumed.
 - Wait briefly for the clipboard offer to settle before sending the paste chord.
-- If the paste chord cannot be sent, leave final text on the clipboard, fire the error cue, record `pasted=false` in history.
+- Mark paste successful only after `wl-copy --paste-once` exits, which means a focused widget consumed the clipboard offer.
+- If no paste chord consumes the clipboard, leave final text on the clipboard, fire the error cue, record `pasted=false` in history.
+- OS-specific output stays behind `paste.OutputBackend`: Linux uses `ydotool`/`wl-copy`; Windows maps the same type, paste, copy, and backspace operations to `SendInput` and the Win32 clipboard.
 
 Live destructive backspaces run only when `streaming.app_output_enabled` is true.
 
@@ -675,7 +678,7 @@ Threat model: one user on one workstation. The daemon handles audio (sensitive c
 - **Temp recording WAVs** live under `/run/user/$UID/mywhispr/recordings`, which is tmpfs (RAM-backed). Files are deleted after transcription. They never reach a persistent filesystem.
 - **Transcripts are RAM-only by default.** Persistent history is opt-in and unimplemented in M1–M2.
 - **Custom words and config** live in `config.json` under the user's home directory, under standard user file permissions. They are not encrypted; treat them as user-confidential.
-- **Clipboard**: the final transcript is copied via `wl-copy --paste-once` so a single paste consumer clears it. On paste failure the text remains on the clipboard until the user copies something else — by design, so the dictation isn't lost.
+- **Clipboard**: short printable ASCII output bypasses the clipboard and is typed through the synthetic-input backend. Longer or non-ASCII output is copied through the current output backend; on Wayland this uses `wl-copy --paste-once` so a single paste consumer clears it. On paste failure the text remains on the clipboard until the user copies something else — by design, so the dictation isn't lost.
 
 ### Audit
 
