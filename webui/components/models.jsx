@@ -250,20 +250,60 @@ function ModelCard({ m, active, onSelect, onDelete, busy }) {
 
 function ExternalApiModelForm({ onSave, busy }) {
   const [open, setOpen] = useState(false);
+  const [jsonDraft, setJsonDraft] = useState("");
+  const [jsonError, setJsonError] = useState("");
   const [draft, setDraft] = useState({
-    name: "gpt-4o-transcribe",
-    label: "GPT-4o Transcribe",
-    provider: "OpenAI",
-    api_base_url: "https://api.openai.com/v1",
-    endpoint: "/audio/transcriptions",
-    api_model: "gpt-4o-transcribe",
-    api_key_env: "OPENAI_API_KEY",
+    name: "remote-large-q5",
+    label: "Remote Whisper Large Q5",
+    provider: "LAN whisper.cpp",
+    api_base_url: "http://192.168.50.100:18178",
+    endpoint: "/inference",
+    api_model: "large-q5",
+    api_key_env: "",
     api_key: "",
-    response_format: "json",
+    api_key_required: false,
+    send_model: false,
+    response_format: "verbose_json",
+    extra_fields: { temperature: "0.0" },
     languages: "en,uk",
-    live_preview: false,
+    live_preview: true,
   });
   const update = (key, value) => setDraft((d) => ({ ...d, [key]: value }));
+  const loadJson = () => {
+    try {
+      const parsed = JSON.parse(jsonDraft);
+      let name = draft.name;
+      let spec = parsed;
+      if (parsed && typeof parsed === "object" && !parsed.backend) {
+        const entries = Object.entries(parsed);
+        if (entries.length > 0) {
+          name = entries[0][0];
+          spec = entries[0][1];
+        }
+      }
+      if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new Error("expected a model object");
+      setDraft((d) => ({
+        ...d,
+        name,
+        label: spec.label || d.label || name,
+        provider: spec.provider || d.provider,
+        api_base_url: spec.api_base_url || d.api_base_url,
+        endpoint: spec.endpoint || d.endpoint,
+        api_model: spec.api_model || d.api_model || name,
+        api_key_env: spec.api_key_env || "",
+        api_key: spec.api_key || "",
+        api_key_required: spec.api_key_required !== undefined ? !!spec.api_key_required : d.api_key_required,
+        send_model: spec.send_model !== undefined ? !!spec.send_model : d.send_model,
+        response_format: spec.response_format || d.response_format,
+        extra_fields: spec.extra_fields && typeof spec.extra_fields === "object" ? spec.extra_fields : d.extra_fields,
+        languages: Array.isArray(spec.languages) ? spec.languages.join(",") : (spec.languages || d.languages),
+        live_preview: spec.live_preview !== undefined ? !!spec.live_preview : d.live_preview,
+      }));
+      setJsonError("");
+    } catch (e) {
+      setJsonError(e.message || "invalid JSON");
+    }
+  };
   const submit = async () => {
     await onSave({
       ...draft,
@@ -319,6 +359,14 @@ function ExternalApiModelForm({ onSave, busy }) {
             <span>Live preview</span>
             <Toggle on={draft.live_preview} onChange={(v) => update("live_preview", v)} />
           </label>
+          <label className="span-2">
+            <span>Import JSON</span>
+            <textarea value={jsonDraft} onChange={(e) => setJsonDraft(e.target.value)} rows="5" />
+          </label>
+          <div className="external-import span-2">
+            <button className="btn sm ghost" onClick={loadJson} disabled={busy || !jsonDraft.trim()}>Load JSON</button>
+            {jsonError && <span>{jsonError}</span>}
+          </div>
           <div className="external-actions span-2">
             <button className="btn primary sm" onClick={submit} disabled={busy}>Save API model</button>
             <button className="btn sm ghost" onClick={() => setOpen(false)} disabled={busy}>Cancel</button>

@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONFIG: dict[str, Any] = {
     "runtime_dir": None,
     "socket_path": None,
-    "default_model": "",
+    "default_model": "remote-large-q5",
     "preload_default_model_on_startup": True,
     "models": copy.deepcopy(BUILTIN_MODEL_OPTIONS),
     "gpu_asr_python": "",
@@ -28,6 +28,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "whisper_startup_timeout_seconds": 180,
     "alternate_whisper_port": 18179,
     "web": {"host": "127.0.0.1", "port": 16666},
+    "transcription_api": {
+        "enabled": False,
+        "host": "0.0.0.0",
+        "port": 18180,
+        "api_key": "",
+        "advertised_host": "",
+        "advertised_scheme": "http",
+        "model_name": "remote-large-q5",
+    },
     "history_limit": 20,
     "maximum_recording_seconds": 240,
     "start_cooldown_seconds": 0.2,
@@ -247,7 +256,7 @@ def _validate(cfg: dict) -> None:
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ConfigError(f"external API model {name!r} has invalid api_base_url {url!r}")
-            if not str(spec.get("api_model") or "").strip():
+            if bool(spec.get("send_model", True)) and not str(spec.get("api_model") or "").strip():
                 raise ConfigError(f"external API model {name!r} is missing api_model")
         elif backend not in MODEL_BACKENDS:
             raise ConfigError(f"model {name!r} has unsupported backend {backend!r}")
@@ -258,6 +267,20 @@ def _validate(cfg: dict) -> None:
     web_host = cfg.get("web", {}).get("host")
     if web_host not in LOOPBACK_HOSTS:
         raise ConfigError(f"web.host must be loopback, got {web_host!r}")
+    api_cfg = cfg.setdefault("transcription_api", {})
+    api_enabled = bool(api_cfg.get("enabled", False))
+    api_host = str(api_cfg.get("host") or "0.0.0.0")
+    api_key = str(api_cfg.get("api_key") or "")
+    if api_enabled and not api_key:
+        raise ConfigError("transcription_api.api_key is required when transcription_api.enabled is true")
+    if not api_host.strip():
+        raise ConfigError("transcription_api.host is required")
+    api_scheme = str(api_cfg.get("advertised_scheme") or "http")
+    if api_scheme not in {"http", "https"}:
+        raise ConfigError("transcription_api.advertised_scheme must be http or https")
+    api_port = int(api_cfg.get("port", 18180))
+    if not 1 <= api_port <= 65535:
+        raise ConfigError(f"transcription_api.port must be in [1, 65535], got {api_port}")
     cd = cfg.get("start_cooldown_seconds", 0.2)
     if not 0.1 <= cd <= 0.4:
         log.warning("start_cooldown_seconds %s outside [0.1, 0.4]; clamping", cd)

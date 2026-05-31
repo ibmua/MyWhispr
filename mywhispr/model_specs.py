@@ -169,43 +169,6 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
     },
 }
 
-EXTERNAL_API_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
-    "gpt-4o-transcribe": {
-        "backend": "external_api",
-        "provider": "OpenAI",
-        "api_base_url": "https://api.openai.com/v1",
-        "endpoint": "/audio/transcriptions",
-        "api_model": "gpt-4o-transcribe",
-        "api_key_env": "OPENAI_API_KEY",
-        "label": "GPT-4o Transcribe",
-        "description": "External API",
-        "subdescription": "OpenAI",
-        "languages": ["en", "uk"],
-        "live_preview": False,
-        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
-    },
-    "gpt-4o-mini-transcribe": {
-        "backend": "external_api",
-        "provider": "OpenAI",
-        "api_base_url": "https://api.openai.com/v1",
-        "endpoint": "/audio/transcriptions",
-        "api_model": "gpt-4o-mini-transcribe",
-        "api_key_env": "OPENAI_API_KEY",
-        "label": "GPT-4o mini Transcribe",
-        "description": "External API",
-        "subdescription": "OpenAI mini",
-        "languages": ["en", "uk"],
-        "live_preview": False,
-        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
-    },
-}
-
-BUILTIN_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
-    **HF_GPU_MODEL_OPTIONS,
-    **EXTERNAL_API_MODEL_OPTIONS,
-}
-
-
 LANGUAGE_NAMES = {
     "ar": "Arabic",
     "bg": "Bulgarian",
@@ -258,6 +221,61 @@ WHISPER_LANGUAGE_CODES = [
     "sw", "ta", "te", "tg", "th", "tk", "tl", "tr", "tt", "ur", "uz", "vi", "yi", "yo",
     "yue", "zh",
 ]
+
+
+EXTERNAL_API_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
+    "remote-large-q5": {
+        "backend": "external_api",
+        "provider": "LAN whisper.cpp",
+        "api_base_url": "http://192.168.50.100:18178",
+        "endpoint": "/inference",
+        "api_model": "large-q5",
+        "api_key_env": "",
+        "api_key_required": False,
+        "send_model": False,
+        "response_format": "verbose_json",
+        "extra_fields": {"temperature": "0.0"},
+        "label": "Remote Whisper Large Q5",
+        "description": "LAN whisper.cpp",
+        "subdescription": "Large Q5",
+        "languages": WHISPER_LANGUAGE_CODES,
+        "live_preview": True,
+        "install_hint": "Run whisper.cpp server on 192.168.50.100:18178.",
+    },
+    "gpt-4o-transcribe": {
+        "backend": "external_api",
+        "provider": "OpenAI",
+        "api_base_url": "https://api.openai.com/v1",
+        "endpoint": "/audio/transcriptions",
+        "api_model": "gpt-4o-transcribe",
+        "api_key_env": "OPENAI_API_KEY",
+        "label": "GPT-4o Transcribe",
+        "description": "External API",
+        "subdescription": "OpenAI",
+        "languages": ["en", "uk"],
+        "live_preview": False,
+        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
+    },
+    "gpt-4o-mini-transcribe": {
+        "backend": "external_api",
+        "provider": "OpenAI",
+        "api_base_url": "https://api.openai.com/v1",
+        "endpoint": "/audio/transcriptions",
+        "api_model": "gpt-4o-mini-transcribe",
+        "api_key_env": "OPENAI_API_KEY",
+        "label": "GPT-4o mini Transcribe",
+        "description": "External API",
+        "subdescription": "OpenAI mini",
+        "languages": ["en", "uk"],
+        "live_preview": False,
+        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
+    },
+}
+
+BUILTIN_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
+    **HF_GPU_MODEL_OPTIONS,
+    **EXTERNAL_API_MODEL_OPTIONS,
+}
 
 
 def normalize_backend(value: Any) -> str:
@@ -323,8 +341,9 @@ def normalize_model_spec(name: str, raw: Any) -> dict[str, Any]:
         spec.setdefault("api_base_url", spec.get("base_url") or "https://api.openai.com/v1")
         spec.setdefault("endpoint", spec.get("api_path") or "/audio/transcriptions")
         spec.setdefault("api_model", spec.get("model_id") or spec.get("model") or name)
-        spec.setdefault("api_key_env", "OPENAI_API_KEY")
         spec.setdefault("api_key_required", True)
+        spec.setdefault("api_key_env", "OPENAI_API_KEY" if bool(spec.get("api_key_required", True)) else "")
+        spec.setdefault("send_model", True)
         spec.setdefault("response_format", "json")
         spec.setdefault("timeout_seconds", 120.0)
         spec.setdefault("description", "External transcription API")
@@ -393,7 +412,9 @@ def hf_cache_state(spec: dict[str, Any]) -> bool | None:
 def model_availability(spec: dict[str, Any]) -> dict[str, Any]:
     backend = spec.get("backend")
     if backend == "external_api":
-        ok = bool(str(spec.get("api_base_url") or "").strip()) and bool(str(spec.get("api_model") or "").strip())
+        has_endpoint = bool(str(spec.get("api_base_url") or "").strip())
+        has_model = bool(str(spec.get("api_model") or "").strip())
+        ok = has_endpoint and (has_model or not bool(spec.get("send_model", True)))
         return {
             "exists": ok,
             "selectable": ok and external_api_key_configured(spec),

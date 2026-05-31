@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 import logging
 import re
-import time
+import socket
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.web_request import FileField
 
 from . import audio_sources
 from .model_specs import BUILTIN_MODEL_OPTIONS, normalize_model_spec, public_model_card
@@ -21,7 +22,57 @@ def _redacted_config(config: dict) -> dict:
     for raw in (out.get("models") or {}).values():
         if isinstance(raw, dict) and raw.get("api_key"):
             raw["api_key"] = "********"
+    api_cfg = out.get("transcription_api") or {}
+    if isinstance(api_cfg, dict) and api_cfg.get("api_key"):
+        api_cfg["api_key"] = "********"
     return out
+
+
+def _lan_ip_guess() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+
+
+def transcription_api_client_spec(config: dict, *, include_key: bool = True) -> dict:
+    api_cfg = config.get("transcription_api") or {}
+    host = str(api_cfg.get("advertised_host") or "").strip() or _lan_ip_guess()
+    scheme = str(api_cfg.get("advertised_scheme") or "http").strip() or "http"
+    port = int(api_cfg.get("port") or 18180)
+    key = str(api_cfg.get("api_key") or "")
+    model_name = str(api_cfg.get("model_name") or "remote-large-q5").strip() or "remote-large-q5"
+    server_model = str(config.get("default_model") or "").strip()
+    server_card = {}
+    models = config.get("models") or {}
+    if server_model in models:
+        try:
+            server_card = public_model_card(server_model, models[server_model])
+        except Exception:
+            server_card = {}
+    label = "Remote Whisper Large Q5" if model_name == "remote-large-q5" else f"MyWhispr {model_name}"
+    spec = {
+        "backend": "external_api",
+        "provider": "MyWhispr LAN",
+        "api_base_url": f"{scheme}://{host}:{port}",
+        "endpoint": "/inference",
+        "api_model": server_model or model_name,
+        "api_key_required": True,
+        "api_key_env": "",
+        "send_model": False,
+        "response_format": "verbose_json",
+        "extra_fields": {"temperature": "0.0"},
+        "label": label,
+        "description": "MyWhispr LAN API",
+        "subdescription": "Shared model",
+        "languages": server_card.get("languages") or ["en", "uk"],
+        "live_preview": True,
+    }
+    if include_key and key:
+        spec["api_key"] = key
+    return spec
 
 
 def _external_api_spec_from_body(name: str, body: dict, existing: dict | None = None) -> dict:
@@ -39,7 +90,11 @@ def _external_api_spec_from_body(name: str, body: dict, existing: dict | None = 
         "response_format": str(body.get("response_format") or (existing or {}).get("response_format") or "json").strip(),
         "live_preview": bool(body.get("live_preview", (existing or {}).get("live_preview", False))),
         "api_key_required": bool(body.get("api_key_required", (existing or {}).get("api_key_required", True))),
+        "send_model": bool(body.get("send_model", (existing or {}).get("send_model", True))),
     }
+    extra_fields = body.get("extra_fields", (existing or {}).get("extra_fields"))
+    if isinstance(extra_fields, dict):
+        spec["extra_fields"] = {str(k): str(v) for k, v in extra_fields.items() if v is not None}
     if "timeout_seconds" in body:
         spec["timeout_seconds"] = max(1.0, float(body.get("timeout_seconds") or 120.0))
     elif existing and "timeout_seconds" in existing:
@@ -147,6 +202,19 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
 
     async def api_config_read(_request):
         return web.json_response(_redacted_config(daemon.config.snapshot()))
+
+    async def api_transcription_share(_request):
+        cfg = daemon.config.snapshot()
+        api_cfg = cfg.get("transcription_api") or {}
+        return web.json_response({
+            "enabled": bool(api_cfg.get("enabled", False)),
+            "running": daemon.transcription_api_runner is not None,
+            "client_model_name": str(api_cfg.get("model_name") or "remote-large-q5"),
+            "client_model": transcription_api_client_spec(cfg, include_key=True),
+            "client_model_json": {
+                str(api_cfg.get("model_name") or "remote-large-q5"): transcription_api_client_spec(cfg, include_key=True)
+            },
+        })
 
     async def api_model_external_save(request):
         try:
@@ -280,6 +348,7 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
     app.router.add_post("/api/model/unload", api_model_unload)
     app.router.add_post("/api/recording/stop", api_recording_stop)
     app.router.add_get("/api/config", api_config_read)
+    app.router.add_get("/api/transcription_api/client_config", api_transcription_share)
     app.router.add_post("/api/config/custom_words", api_config_custom_words)
     app.router.add_post("/api/config/{key:.+}", api_config_write)
     app.router.add_get("/api/audio_sources", api_audio_sources)
@@ -290,6 +359,67 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
     return app
 
 
+def _authorized(request: web.Request, api_key: str) -> bool:
+    if not api_key:
+        return False
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {api_key}":
+        return True
+    if request.headers.get("X-API-Key", "") == api_key:
+        return True
+    return False
+
+
+def build_transcription_api_app(daemon) -> web.Application:
+    app = web.Application(client_max_size=64 * 1024 * 1024)
+    app["daemon"] = daemon
+
+    async def health(_request):
+        return web.json_response({"ok": True, "service": "mywhispr-transcription-api"})
+
+    async def transcribe(request):
+        api_cfg = daemon.config.get("transcription_api") or {}
+        api_key = str(api_cfg.get("api_key") or "")
+        if not _authorized(request, api_key):
+            raise web.HTTPUnauthorized(text="missing or invalid API key")
+        post = await request.post()
+        file_field = post.get("file")
+        if not isinstance(file_field, FileField):
+            return web.json_response({"error": "missing multipart file field 'file'"}, status=400)
+        wav_bytes = file_field.file.read()
+        if not wav_bytes:
+            return web.json_response({"error": "empty audio file"}, status=400)
+        language = str(post.get("language") or "auto")
+        model = str(post.get("model") or daemon.config.get("default_model") or "")
+        try:
+            result = await daemon.transcriber.transcribe(
+                daemon.primary_server,
+                wav_bytes,
+                language=language,
+                model=model if model in (daemon.config.get("models") or {}) else None,
+            )
+        except Exception as e:
+            log.exception("shared transcription API request failed")
+            return web.json_response({"error": str(e) or type(e).__name__}, status=500)
+        response_format = str(post.get("response_format") or "json")
+        payload = {
+            "text": result.raw_text or result.text,
+            "segments": result.segments,
+            "model": result.model,
+            "language": language,
+            "elapsed_seconds": result.elapsed_seconds,
+        }
+        if response_format == "text":
+            return web.Response(text=payload["text"], content_type="text/plain")
+        return web.json_response(payload)
+
+    app.router.add_get("/health", health)
+    app.router.add_post("/inference", transcribe)
+    app.router.add_post("/audio/transcriptions", transcribe)
+    app.router.add_post("/v1/audio/transcriptions", transcribe)
+    return app
+
+
 async def start_web_server(daemon, host: str, port: int, webui_dir: Path):
     app = build_app(daemon, webui_dir)
     runner = web.AppRunner(app, handle_signals=False, access_log=None)
@@ -297,4 +427,14 @@ async def start_web_server(daemon, host: str, port: int, webui_dir: Path):
     site = web.TCPSite(runner, host, port)
     await site.start()
     log.info("web ui listening http://%s:%s", host, port)
+    return runner
+
+
+async def start_transcription_api_server(daemon, host: str, port: int):
+    app = build_transcription_api_app(daemon)
+    runner = web.AppRunner(app, handle_signals=False, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    log.info("transcription API listening http://%s:%s", host, port)
     return runner

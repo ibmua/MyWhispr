@@ -6,6 +6,7 @@ function App() {
   const [models, setModels] = useState(null);      // /api/models
   const [shortcuts, setShortcuts] = useState(null);// /api/shortcuts
   const [audioSources, setAudioSources] = useState(null); // /api/audio_sources
+  const [shareConfig, setShareConfig] = useState(null); // /api/transcription_api/client_config
   const [history, setHistory] = useState([]);
   const [online, setOnline] = useState(true);
   const [notice, setNotice] = useState(null);      // {kind, text} | null
@@ -47,12 +48,21 @@ function App() {
     }
   }, []);
 
+  const reloadShareConfig = useCallback(async () => {
+    try {
+      setShareConfig(await API.getJSON("/api/transcription_api/client_config"));
+    } catch (e) {
+      // surfaced via offline state
+    }
+  }, []);
+
   // initial load
   useEffect(() => {
     reloadConfig();
     reloadModels();
     reloadAudioSources();
-  }, [reloadConfig, reloadModels, reloadAudioSources]);
+    reloadShareConfig();
+  }, [reloadConfig, reloadModels, reloadAudioSources, reloadShareConfig]);
 
   // poll status + history
   useEffect(() => {
@@ -69,6 +79,7 @@ function App() {
         setHistory(h.items || []);
         if (modelsTick++ % 6 === 0) {
           try { setModels(await API.getJSON("/api/models")); } catch (e) { /* ignored */ }
+          try { setShareConfig(await API.getJSON("/api/transcription_api/client_config")); } catch (e) { /* ignored */ }
         }
         setOnline(true);
       } catch (e) {
@@ -87,10 +98,11 @@ function App() {
       const r = await API.postJSON("/api/config/" + encodeURIComponent(key), { value });
       if (!r.ok) throw new Error(r.reason || "setting rejected");
       await reloadConfig();
+      await reloadShareConfig();
     } catch (e) {
       flashNotice("Save failed: " + e.message, "error");
     }
-  }, [reloadConfig, flashNotice]);
+  }, [reloadConfig, reloadShareConfig, flashNotice]);
 
   const switchModel = useCallback(async (name) => {
     setModelBusy(true);
@@ -248,7 +260,7 @@ function App() {
   const hallucinationPhrases = (getPath(config, "hallucination_filter.phrases.en") || []);
   const devices = (snap && snap.device_names) || [];
 
-  const onRefresh = () => { reloadConfig(); reloadModels(); reloadAudioSources(); flashNotice("Refreshed"); };
+  const onRefresh = () => { reloadConfig(); reloadModels(); reloadAudioSources(); reloadShareConfig(); flashNotice("Refreshed"); };
 
   if (!ready && !snap) {
     return (
@@ -308,6 +320,8 @@ function App() {
           audioSources={audioSources}
           onReloadAudioSources={reloadAudioSources}
           transcribing={transcribing}
+          shareConfig={shareConfig}
+          onCopy={copyText}
         />
         <ShortcutsCard
           config={config}

@@ -1,5 +1,5 @@
 {
-  "default_model": "large-q5",
+  "default_model": "remote-large-q5",
   "preload_default_model_on_startup": true,
   "gpu_asr_python": "./.venv-gpu-asr/bin/python",
   "models": {
@@ -21,18 +21,21 @@
       "description": "Fast secondary",
       "subdescription": "NVIDIA TDT"
     },
-    "gpt-4o-transcribe": {
+    "remote-large-q5": {
       "backend": "external_api",
-      "provider": "OpenAI",
-      "api_base_url": "https://api.openai.com/v1",
-      "endpoint": "/audio/transcriptions",
-      "api_model": "gpt-4o-transcribe",
-      "api_key_env": "OPENAI_API_KEY",
-      "label": "GPT-4o Transcribe",
-      "description": "External API",
-      "subdescription": "OpenAI",
+      "provider": "LAN whisper.cpp",
+      "api_base_url": "http://192.168.50.100:18178",
+      "endpoint": "/inference",
+      "api_model": "large-q5",
+      "api_key_required": false,
+      "send_model": false,
+      "response_format": "verbose_json",
+      "extra_fields": {"temperature": "0.0"},
+      "label": "Remote Whisper Large Q5",
+      "description": "LAN whisper.cpp",
+      "subdescription": "Large Q5",
       "languages": ["en", "uk"],
-      "live_preview": false
+      "live_preview": true
     },
     "turbo": {
       "backend": "whisper.cpp",
@@ -68,6 +71,15 @@
   "whisper_port": 18178,
   "whisper_idle_shutdown_seconds": 0,
   "web": {"host": "127.0.0.1", "port": 16666},
+  "transcription_api": {
+    "enabled": false,
+    "host": "0.0.0.0",
+    "port": 18180,
+    "api_key": "",
+    "advertised_host": "",
+    "advertised_scheme": "http",
+    "model_name": "remote-large-q5"
+  },
   "history_limit": 20,
   "start_cooldown_seconds": 0.2,
   "clipboard_paste_consume_timeout_seconds": 0.8,

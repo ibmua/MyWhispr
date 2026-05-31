@@ -101,7 +101,103 @@ function AudioInputRow({ audioSources, onReloadAudioSources, onWrite, transcribi
   );
 }
 
-function SettingsCard({ config, onWrite, hallucinationPhrases, onSaveHallucinationPhrases, devices, audioSources, onReloadAudioSources, transcribing }) {
+function randomApiKey() {
+  const bytes = new Uint8Array(24);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function TranscriptionApiShare({ config, shareConfig, onWrite, onCopy }) {
+  const api = (config && config.transcription_api) || {};
+  const enabled = !!api.enabled;
+  const running = !!(shareConfig && shareConfig.running);
+  const [hostDraft, setHostDraft] = useState(api.host || "0.0.0.0");
+  const [portDraft, setPortDraft] = useState(String(api.port || 18180));
+  const [advertisedDraft, setAdvertisedDraft] = useState(api.advertised_host || "");
+  const [keyDraft, setKeyDraft] = useState("");
+  useEffect(() => setHostDraft(api.host || "0.0.0.0"), [api.host]);
+  useEffect(() => setPortDraft(String(api.port || 18180)), [api.port]);
+  useEffect(() => setAdvertisedDraft(api.advertised_host || ""), [api.advertised_host]);
+  const modelJson = shareConfig && shareConfig.client_model_json
+    ? JSON.stringify(shareConfig.client_model_json, null, 2)
+    : "";
+  const setEnabled = async (on) => {
+    if (on && !api.api_key) {
+      await onWrite("transcription_api.api_key", randomApiKey());
+    }
+    await onWrite("transcription_api.enabled", !!on);
+  };
+  const commitPort = () => {
+    const v = parseInt(portDraft, 10);
+    if (!isNaN(v) && v > 0 && v < 65536) onWrite("transcription_api.port", v);
+    else setPortDraft(String(api.port || 18180));
+  };
+  const commitKey = () => {
+    const v = keyDraft.trim();
+    if (v) {
+      onWrite("transcription_api.api_key", v);
+      setKeyDraft("");
+    }
+  };
+  const generateKey = () => {
+    const key = randomApiKey();
+    setKeyDraft("");
+    onWrite("transcription_api.api_key", key);
+  };
+  return (
+    <div className="share-api-panel">
+      <div className="share-api-head">
+        <div>
+          <div className="share-title">Shared transcription API</div>
+          <div className="share-sub">{running ? "listening" : enabled ? "starting" : "off"}</div>
+        </div>
+        <Toggle on={enabled} onChange={setEnabled} accent />
+      </div>
+      <div className="share-api-grid">
+        <label>
+          <span>Bind host</span>
+          <input value={hostDraft} onChange={(e) => setHostDraft(e.target.value)}
+            onBlur={() => onWrite("transcription_api.host", hostDraft.trim() || "0.0.0.0")} />
+        </label>
+        <label>
+          <span>Port</span>
+          <input value={portDraft} onChange={(e) => setPortDraft(e.target.value.replace(/[^0-9]/g, ""))}
+            onBlur={commitPort} />
+        </label>
+        <label>
+          <span>Advertise host</span>
+          <input value={advertisedDraft} onChange={(e) => setAdvertisedDraft(e.target.value)}
+            onBlur={() => onWrite("transcription_api.advertised_host", advertisedDraft.trim())}
+            placeholder="auto LAN IP" />
+        </label>
+        <label>
+          <span>Client model name</span>
+          <input value={api.model_name || "remote-large-q5"}
+            onChange={(e) => onWrite("transcription_api.model_name", e.target.value)} />
+        </label>
+        <label className="span-2">
+          <span>API key</span>
+          <div className="share-key-row">
+            <input type="password" value={keyDraft} onChange={(e) => setKeyDraft(e.target.value)}
+              onBlur={commitKey} placeholder={api.api_key ? "configured" : "required before enabling"} />
+            <button className="btn sm ghost" onClick={generateKey}>Generate</button>
+          </div>
+        </label>
+      </div>
+      {modelJson && (
+        <div className="share-json-wrap">
+          <div className="share-json-head">
+            <span>Client JSON</span>
+            <button className="btn sm ghost" onClick={() => onCopy(modelJson)}>Copy JSON</button>
+          </div>
+          <pre className="share-json">{modelJson}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsCard({ config, onWrite, hallucinationPhrases, onSaveHallucinationPhrases, devices, audioSources, onReloadAudioSources, transcribing, shareConfig, onCopy }) {
   const get = (path, fallback) => {
     const v = getPath(config, path);
     return v === undefined ? fallback : v;
@@ -154,6 +250,13 @@ function SettingsCard({ config, onWrite, hallucinationPhrases, onSaveHallucinati
         onReloadAudioSources={onReloadAudioSources}
         onWrite={onWrite}
         transcribing={transcribing}
+      />
+
+      <TranscriptionApiShare
+        config={config}
+        shareConfig={shareConfig}
+        onWrite={onWrite}
+        onCopy={onCopy}
       />
 
       <div className="settings-grid">

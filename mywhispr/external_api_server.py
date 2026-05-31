@@ -70,7 +70,7 @@ class ExternalApiServer:
         if not self._url(spec):
             self.last_error = f"external API endpoint missing for {target!r}"
             return False
-        if not str(spec.get("api_model") or "").strip():
+        if bool(spec.get("send_model", True)) and not str(spec.get("api_model") or "").strip():
             self.last_error = f"external API model id missing for {target!r}"
             return False
         if bool(spec.get("api_key_required", True)) and not self._api_key(spec):
@@ -183,7 +183,8 @@ class ExternalApiServer:
     ) -> dict[str, Any]:
         form = aiohttp.FormData()
         form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-        form.add_field("model", str(spec.get("api_model") or ""))
+        if bool(spec.get("send_model", True)):
+            form.add_field("model", str(spec.get("api_model") or ""))
         if language and language != "auto" and bool(spec.get("send_language", True)):
             form.add_field(str(spec.get("language_field") or "language"), language)
         if prompt and bool(spec.get("send_prompt", True)):

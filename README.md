@@ -146,10 +146,16 @@ HF cache:
 
 The included model catalog covers whisper.cpp models plus GPU ASR backends for
 Qwen, Parakeet, Canary, Cohere, Granite, and Seamless M4T. The web UI can also
-add OpenAI-compatible external API models such as `gpt-4o-transcribe`; set the
-API key through an environment variable like `OPENAI_API_KEY` or the local
-model form. Model weights, virtualenvs, local config, and transcript scratch
-files are intentionally ignored by git.
+add external API models. The default API template is `remote-large-q5`, a LAN
+whisper.cpp Large Q5 server at `http://192.168.50.100:18178/inference`; OpenAI
+transcription models are also available if an API key is configured. Model
+weights, virtualenvs, local config, and transcript scratch files are
+intentionally ignored by git.
+
+The Settings panel can also expose this MyWhispr instance as an authenticated
+LAN transcription API. When enabled, it serves OpenAI-style multipart
+transcriptions and shows copyable client JSON that another MyWhispr instance can
+paste into its API model configuration.
 
 ## Architecture
 
@@ -176,6 +182,8 @@ The detailed implementation plan and design constraints live in
 - Temporary recordings live under `/run/user/$UID`, which is tmpfs on typical
   Linux desktops.
 - The web UI binds to `127.0.0.1` by default.
+- The shared transcription API is disabled by default and requires an API key
+  before it can start.
 - Transcript text is not logged by default.
 - Config and custom words live in `config.json`; treat that file as
   user-confidential.

@@ -23,7 +23,7 @@ from .state import IGNORED_BY_DESIGN, Event, State
 from .streaming import StreamingSession
 from .tones import Tones
 from .transcriber import Transcriber
-from .web import start_web_server
+from .web import start_transcription_api_server, start_web_server
 from .model_server import ModelServer
 
 log = logging.getLogger(__name__)
@@ -95,6 +95,8 @@ class Daemon:
 
         self.control_server: ControlSocketServer | None = None
         self.web_runner = None
+        self.transcription_api_runner = None
+        self._transcription_api_lock = asyncio.Lock()
         self.input_supervisor: InputSupervisor | None = None
         self.event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -188,6 +190,7 @@ class Daemon:
         self.web_runner = await start_web_server(
             self, webcfg.get("host", "127.0.0.1"), int(webcfg.get("port", 16666)), self.webui_dir,
         )
+        await self._sync_transcription_api_server()
 
         self.config.subscribe(self._config_changed)
 
@@ -211,6 +214,8 @@ class Daemon:
             await self.input_supervisor.stop()
         if self.web_runner is not None:
             await self.web_runner.cleanup()
+        if self.transcription_api_runner is not None:
+            await self.transcription_api_runner.cleanup()
         await self.primary_server.stop()
         await self.transcriber.close()
 
@@ -228,6 +233,25 @@ class Daemon:
         self.primary_server.set_idle_shutdown_seconds(
             float(snapshot.get("whisper_idle_shutdown_seconds", 0.0))
         )
+        if key == "__reload__" or key.startswith("transcription_api"):
+            asyncio.create_task(self._sync_transcription_api_server())
+
+    async def _sync_transcription_api_server(self) -> None:
+        async with self._transcription_api_lock:
+            api_cfg = self.config.get("transcription_api") or {}
+            enabled = bool(api_cfg.get("enabled", False))
+            if self.transcription_api_runner is not None:
+                await self.transcription_api_runner.cleanup()
+                self.transcription_api_runner = None
+            if not enabled:
+                return
+            host = str(api_cfg.get("host") or "0.0.0.0")
+            port = int(api_cfg.get("port") or 18180)
+            try:
+                self.transcription_api_runner = await start_transcription_api_server(self, host, port)
+            except Exception as e:
+                self._error_message = f"transcription API failed: {e}"
+                log.exception("transcription API start failed")
 
     def _schedule_warm(self, model: str | None, *, reason: str) -> bool:
         model = str(model or "").strip()
@@ -686,6 +710,11 @@ class Daemon:
             "topbar": self.config.get("topbar") or {},
             "audio_input_device": self.config.get("audio_input_device") or "",
             "session_nostream": self._session_nostream,
+            "transcription_api": {
+                **(self.config.get("transcription_api") or {}),
+                "running": self.transcription_api_runner is not None,
+                "api_key": "********" if (self.config.get("transcription_api.api_key") or "") else "",
+            },
         }
 
     # ----------------------------------------------------- internal helpers
