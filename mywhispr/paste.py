@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
+import os
+import re
 import sys
 from typing import Protocol
 
@@ -38,6 +41,7 @@ _ASCII_SHIFTED = {
     "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "~": "`",
     "<": ",", ">": ".", "?": "/",
 }
+_FAST_TYPE_US_LAYOUTS = {"us"}
 
 
 class OutputBackend(Protocol):
@@ -67,6 +71,9 @@ class LinuxWaylandYdotoolBackend:
     name = "linux-wayland-ydotool"
 
     async def type_text(self, text: str, *, delay_ms: int) -> bool:
+        if not await _linux_fast_type_safe_for_current_layout():
+            log.info("direct type disabled; active Linux input source is not US keycode compatible")
+            return False
         if delay_ms <= 0:
             ok = await _ydotool_type_ascii_fast(text)
             if ok:
@@ -284,6 +291,85 @@ async def _ydotool_type(text: str, *, delay_ms: int | None = None) -> bool:
         log.error("ydotool type rc=%s err=%r", rc, err)
         return False
     return True
+
+
+async def _command_stdout(args: list[str], *, timeout: float = 0.5) -> str:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return out.decode("utf-8", "replace").strip()
+
+
+def _parse_gsettings_current(raw: str) -> int | None:
+    matches = re.findall(r"\d+", raw or "")
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return None
+
+
+def _parse_gsettings_sources(raw: str) -> list[tuple[str, str]]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = ast.literal_eval(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        out: list[tuple[str, str]] = []
+        for item in parsed:
+            if isinstance(item, tuple) and len(item) == 2:
+                out.append((str(item[0]), str(item[1])))
+        if out:
+            return out
+    return [(a, b) for a, b in re.findall(r"\('([^']+)',\s*'([^']+)'\)", text)]
+
+
+def _source_id_uses_us_keycodes(source_type: str, source_id: str) -> bool:
+    if source_type != "xkb":
+        return False
+    return source_id.lower() in _FAST_TYPE_US_LAYOUTS
+
+
+async def _linux_fast_type_safe_for_current_layout() -> bool:
+    if sys.platform == "win32":
+        return True
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+    if desktop and "gnome" not in desktop and "ubuntu" not in desktop:
+        return False
+    current_raw, sources_raw = await asyncio.gather(
+        _command_stdout(["gsettings", "get", "org.gnome.desktop.input-sources", "current"]),
+        _command_stdout(["gsettings", "get", "org.gnome.desktop.input-sources", "sources"]),
+    )
+    idx = _parse_gsettings_current(current_raw)
+    sources = _parse_gsettings_sources(sources_raw)
+    if idx is None or idx < 0 or idx >= len(sources):
+        return False
+    source_type, source_id = sources[idx]
+    return _source_id_uses_us_keycodes(source_type, source_id)
 
 
 def _ascii_key_chord(ch: str) -> list[str] | None:

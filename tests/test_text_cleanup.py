@@ -27,6 +27,13 @@ class PasteRoutingTest(unittest.TestCase):
         for ch in sample:
             self.assertIsNotNone(paste._ascii_key_chord(ch), ch)
 
+    def test_gnome_input_source_parsing_gates_fast_type(self) -> None:
+        sources = paste._parse_gsettings_sources("[('xkb', 'us'), ('xkb', 'ua+winkeys')]")
+        self.assertEqual(paste._parse_gsettings_current("uint32 0"), 0)
+        self.assertEqual(sources, [("xkb", "us"), ("xkb", "ua+winkeys")])
+        self.assertTrue(paste._source_id_uses_us_keycodes(*sources[0]))
+        self.assertFalse(paste._source_id_uses_us_keycodes(*sources[1]))
+
 
 class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
     async def test_short_printable_ascii_uses_type_before_clipboard(self) -> None:
