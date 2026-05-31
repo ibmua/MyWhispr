@@ -116,6 +116,7 @@ const LANGUAGE_PRIORITY = ["uk", "en"];
 
 function modelIconName(name) {
   const n = String(name || "").toLowerCase();
+  if (n.includes("api") || n.includes("gpt") || n.includes("cloud")) return "Bolt";
   if (n.includes("qwen") || n.includes("cohere") || n.includes("granite") || n.includes("canary") || n.includes("seamless")) return "Brain";
   if (n.includes("parakeet")) return "Bolt";
   if (n.includes("small") || n.includes("base") || n.includes("tiny")) return "Leaf";
@@ -127,6 +128,7 @@ function modelIconName(name) {
 function modelMeta(name) {
   const n = String(name || "").toLowerCase();
   if (MODEL_DESC[name]) return MODEL_DESC[name];
+  if (n.includes("gpt-4o") || n.includes("transcribe")) return { desc: "External API", subdesc: "Cloud" };
   if (n.includes("qwen3-asr-1.7")) return { desc: "High accuracy", subdesc: "Qwen GPU" };
   if (n.includes("qwen3-asr-0.6")) return { desc: "Fast compact", subdesc: "Qwen GPU" };
   if (n.includes("parakeet")) return { desc: "Fast multilingual", subdesc: "NVIDIA TDT" };
@@ -160,7 +162,7 @@ function languageBadges(languages) {
   ];
 }
 
-function ModelCard({ m, active, onSelect, busy }) {
+function ModelCard({ m, active, onSelect, onDelete, busy }) {
   const IconComp = Icon[modelIconName(m.name)] || Icon.Bolt;
   const fallbackMeta = modelMeta(m.name);
   const meta = {
@@ -182,7 +184,8 @@ function ModelCard({ m, active, onSelect, busy }) {
     busy && "busy",
   ].filter(Boolean).join(" ");
   let badge = "ready";
-  if (m.cached === false) badge = "not cached";
+  if (m.backend === "external_api" && !m.api_key_configured && m.api_key_required !== false) badge = "key missing";
+  else if (m.cached === false) badge = "not cached";
   else if (!selectable) badge = "missing";
   else if (m.running) badge = "running";
   else if (active) badge = "active";
@@ -199,14 +202,29 @@ function ModelCard({ m, active, onSelect, busy }) {
       <div className="model-top">
         <span className="model-icon"><IconComp /></span>
         <span className="model-name">{m.label || m.name}</span>
+        {m.backend === "external_api" && !m.builtin && (
+          <button
+            className="icon-btn model-delete"
+            title="Delete external model"
+            onClick={(e) => { e.stopPropagation(); onDelete && onDelete(m.name); }}
+            disabled={busy}
+          >
+            <Icon.Trash />
+          </button>
+        )}
         <span className="badge">{badge}</span>
       </div>
       <div className="model-size">
-        {m.backend === "whisper.cpp" ? fmt.bytes(m.size_bytes) : "GPU streaming"}
+        {m.backend === "whisper.cpp" ? fmt.bytes(m.size_bytes) : (m.backend === "external_api" ? "External API" : "GPU streaming")}
       </div>
       <div className="model-desc">
         {meta.desc}{meta.subdesc && <><span className="dot">•</span>{meta.subdesc}</>}
       </div>
+      {m.backend === "external_api" && (
+        <div className="model-api-line">
+          {(m.provider || "API")} <span className="dot">•</span> {m.api_model || m.name}
+        </div>
+      )}
       {langs.length > 0 && (
         <div
           className="model-languages"
@@ -230,7 +248,88 @@ function ModelCard({ m, active, onSelect, busy }) {
   );
 }
 
-function ModelsCard({ models, activeModel, onSelect, onUnload, busy }) {
+function ExternalApiModelForm({ onSave, busy }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState({
+    name: "gpt-4o-transcribe",
+    label: "GPT-4o Transcribe",
+    provider: "OpenAI",
+    api_base_url: "https://api.openai.com/v1",
+    endpoint: "/audio/transcriptions",
+    api_model: "gpt-4o-transcribe",
+    api_key_env: "OPENAI_API_KEY",
+    api_key: "",
+    response_format: "json",
+    languages: "en,uk",
+    live_preview: false,
+  });
+  const update = (key, value) => setDraft((d) => ({ ...d, [key]: value }));
+  const submit = async () => {
+    await onSave({
+      ...draft,
+      languages: draft.languages.split(",").map((s) => s.trim()).filter(Boolean),
+    });
+    setDraft((d) => ({ ...d, api_key: "" }));
+    setOpen(false);
+  };
+  return (
+    <div className={`external-model-editor ${open ? "open" : ""}`}>
+      <button className="btn sm ghost" onClick={() => setOpen(!open)} disabled={busy}>
+        <Icon.Plus /> API model
+      </button>
+      {open && (
+        <div className="external-model-grid">
+          <label>
+            <span>Name</span>
+            <input value={draft.name} onChange={(e) => update("name", e.target.value)} />
+          </label>
+          <label>
+            <span>Label</span>
+            <input value={draft.label} onChange={(e) => update("label", e.target.value)} />
+          </label>
+          <label>
+            <span>Provider</span>
+            <input value={draft.provider} onChange={(e) => update("provider", e.target.value)} />
+          </label>
+          <label>
+            <span>API model</span>
+            <input value={draft.api_model} onChange={(e) => update("api_model", e.target.value)} />
+          </label>
+          <label className="span-2">
+            <span>Base URL</span>
+            <input value={draft.api_base_url} onChange={(e) => update("api_base_url", e.target.value)} />
+          </label>
+          <label>
+            <span>Endpoint</span>
+            <input value={draft.endpoint} onChange={(e) => update("endpoint", e.target.value)} />
+          </label>
+          <label>
+            <span>Key env</span>
+            <input value={draft.api_key_env} onChange={(e) => update("api_key_env", e.target.value)} />
+          </label>
+          <label>
+            <span>API key</span>
+            <input type="password" value={draft.api_key} onChange={(e) => update("api_key", e.target.value)} placeholder="optional" />
+          </label>
+          <label>
+            <span>Languages</span>
+            <input value={draft.languages} onChange={(e) => update("languages", e.target.value)} />
+          </label>
+          <label className="external-toggle">
+            <span>Live preview</span>
+            <Toggle on={draft.live_preview} onChange={(v) => update("live_preview", v)} />
+          </label>
+          <div className="external-actions span-2">
+            <button className="btn primary sm" onClick={submit} disabled={busy}>Save API model</button>
+            <button className="btn sm ghost" onClick={() => setOpen(false)} disabled={busy}>Cancel</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ModelsCard({ models, activeModel, onSelect, onUnload, onSaveExternal, onDeleteModel, busy }) {
   const items = (models && models.items) || [];
   const anyRunning = items.some((m) => m.running);
   return (
@@ -244,6 +343,7 @@ function ModelsCard({ models, activeModel, onSelect, onUnload, busy }) {
           </button>
         )}
       </div>
+      <ExternalApiModelForm onSave={onSaveExternal} busy={busy} />
       <div className="model-row">
         {items.length === 0
           ? <div className="muted" style={{ padding: 12 }}>No models configured.</div>
@@ -253,6 +353,7 @@ function ModelsCard({ models, activeModel, onSelect, onUnload, busy }) {
                 m={m}
                 active={activeModel === m.name}
                 onSelect={onSelect}
+                onDelete={onDeleteModel}
                 busy={busy}
               />
             ))

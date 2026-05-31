@@ -121,6 +121,37 @@ function App() {
     }
   }, [reloadModels, flashNotice]);
 
+  const saveExternalModel = useCallback(async (draft) => {
+    setModelBusy(true);
+    try {
+      const r = await API.postJSON("/api/models/external", draft);
+      if (!r.ok) throw new Error(r.reason || "save failed");
+      await reloadConfig();
+      await reloadModels();
+      flashNotice("API model saved");
+    } catch (e) {
+      flashNotice("API model failed: " + e.message, "error");
+    } finally {
+      setModelBusy(false);
+    }
+  }, [reloadConfig, reloadModels, flashNotice]);
+
+  const deleteModel = useCallback(async (name) => {
+    if (!window.confirm("Delete model " + name + "?")) return;
+    setModelBusy(true);
+    try {
+      const r = await API.delJSON("/api/models/" + encodeURIComponent(name));
+      if (!r.ok) throw new Error(r.reason || "delete failed");
+      await reloadConfig();
+      await reloadModels();
+      flashNotice("Model deleted");
+    } catch (e) {
+      flashNotice("Delete failed: " + e.message, "error");
+    } finally {
+      setModelBusy(false);
+    }
+  }, [reloadConfig, reloadModels, flashNotice]);
+
   const saveCustomWords = useCallback(async (words) => {
     try {
       const r = await API.postJSON("/api/config/custom_words", { words });
@@ -260,6 +291,8 @@ function App() {
           activeModel={activeModel}
           onSelect={switchModel}
           onUnload={unloadModel}
+          onSaveExternal={saveExternalModel}
+          onDeleteModel={deleteModel}
           busy={modelBusy}
         />
         <DaemonStatus

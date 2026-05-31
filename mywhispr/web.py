@@ -1,15 +1,65 @@
 from __future__ import annotations
 
+import copy
 import logging
+import re
 import time
 from pathlib import Path
 
 from aiohttp import web
 
 from . import audio_sources
-from .model_specs import public_model_card
+from .model_specs import BUILTIN_MODEL_OPTIONS, normalize_model_spec, public_model_card
 
 log = logging.getLogger(__name__)
+
+MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+
+def _redacted_config(config: dict) -> dict:
+    out = copy.deepcopy(config)
+    for raw in (out.get("models") or {}).values():
+        if isinstance(raw, dict) and raw.get("api_key"):
+            raw["api_key"] = "********"
+    return out
+
+
+def _external_api_spec_from_body(name: str, body: dict, existing: dict | None = None) -> dict:
+    spec = {
+        "backend": "external_api",
+        "provider": str(body.get("provider") or (existing or {}).get("provider") or "External API").strip(),
+        "label": str(body.get("label") or (existing or {}).get("label") or name).strip(),
+        "description": str(body.get("description") or (existing or {}).get("description") or "External transcription API").strip(),
+        "subdescription": str(body.get("subdescription") or (existing or {}).get("subdescription") or "API").strip(),
+        "api_base_url": str(body.get("api_base_url") or (existing or {}).get("api_base_url") or "https://api.openai.com/v1").strip(),
+        "endpoint": str(body.get("endpoint") or (existing or {}).get("endpoint") or "/audio/transcriptions").strip(),
+        "api_model": str(body.get("api_model") or (existing or {}).get("api_model") or name).strip(),
+        "api_key_env": str(body.get("api_key_env") or (existing or {}).get("api_key_env") or "OPENAI_API_KEY").strip(),
+        "api_key_file": str(body.get("api_key_file") or (existing or {}).get("api_key_file") or "").strip(),
+        "response_format": str(body.get("response_format") or (existing or {}).get("response_format") or "json").strip(),
+        "live_preview": bool(body.get("live_preview", (existing or {}).get("live_preview", False))),
+        "api_key_required": bool(body.get("api_key_required", (existing or {}).get("api_key_required", True))),
+    }
+    if "timeout_seconds" in body:
+        spec["timeout_seconds"] = max(1.0, float(body.get("timeout_seconds") or 120.0))
+    elif existing and "timeout_seconds" in existing:
+        spec["timeout_seconds"] = existing["timeout_seconds"]
+    else:
+        spec["timeout_seconds"] = 120.0
+    languages = body.get("languages")
+    if isinstance(languages, str):
+        languages = [s.strip() for s in languages.split(",") if s.strip()]
+    if isinstance(languages, list):
+        spec["languages"] = [str(s).strip() for s in languages if str(s).strip()]
+    elif existing and isinstance(existing.get("languages"), list):
+        spec["languages"] = existing["languages"]
+    if body.get("clear_api_key"):
+        pass
+    elif isinstance(body.get("api_key"), str) and body.get("api_key").strip():
+        spec["api_key"] = body["api_key"].strip()
+    elif existing and existing.get("api_key"):
+        spec["api_key"] = existing["api_key"]
+    return spec
 
 
 def build_app(daemon, webui_dir: Path) -> web.Application:
@@ -96,7 +146,47 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
         return web.json_response({"ok": ok, "state": daemon.state.value})
 
     async def api_config_read(_request):
-        return web.json_response(daemon.config.snapshot())
+        return web.json_response(_redacted_config(daemon.config.snapshot()))
+
+    async def api_model_external_save(request):
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "reason": "invalid_json"}, status=400)
+        name = str(body.get("name") or body.get("api_model") or "").strip()
+        if not MODEL_NAME_RE.match(name):
+            return web.json_response(
+                {"ok": False, "reason": "model name must use letters, numbers, dot, underscore, or dash"},
+                status=400,
+            )
+        models = daemon.config.get("models") or {}
+        existing = models.get(name) if isinstance(models.get(name), dict) else None
+        spec = _external_api_spec_from_body(name, body, existing)
+        try:
+            normalize_model_spec(name, spec)
+            next_models = dict(models)
+            next_models[name] = spec
+            daemon.config.set("models", next_models)
+        except Exception as e:
+            return web.json_response({"ok": False, "reason": str(e)}, status=400)
+        return web.json_response({"ok": True, "model": public_model_card(name, spec)})
+
+    async def api_model_delete(request):
+        name = request.match_info["name"]
+        models = daemon.config.get("models") or {}
+        if name not in models:
+            return web.json_response({"ok": False, "reason": f"unknown model {name!r}"}, status=404)
+        if name in BUILTIN_MODEL_OPTIONS:
+            return web.json_response({"ok": False, "reason": "built-in models cannot be deleted"}, status=409)
+        spec = normalize_model_spec(name, models[name])
+        if spec.get("backend") == "whisper.cpp" and daemon.config.get("default_model") == name:
+            return web.json_response({"ok": False, "reason": "cannot delete the active local default model"}, status=409)
+        if daemon.primary_server.loaded_model == name:
+            await daemon.unload_model()
+        next_models = dict(models)
+        next_models.pop(name, None)
+        daemon.config.set("models", next_models)
+        return web.json_response({"ok": True, "name": name})
 
     async def api_config_write(request):
         key = request.match_info["key"]
@@ -185,6 +275,8 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
     app.router.add_post("/api/history/retranslate", api_history_retranslate)
     app.router.add_post("/api/model/warm", api_model_warm)
     app.router.add_get("/api/models", api_models)
+    app.router.add_post("/api/models/external", api_model_external_save)
+    app.router.add_delete("/api/models/{name}", api_model_delete)
     app.router.add_post("/api/model/unload", api_model_unload)
     app.router.add_post("/api/recording/stop", api_recording_stop)
     app.router.add_get("/api/config", api_config_read)

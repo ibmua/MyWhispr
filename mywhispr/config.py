@@ -7,8 +7,9 @@ import os
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from .model_specs import HF_GPU_MODEL_OPTIONS, normalize_model_spec
+from .model_specs import BUILTIN_MODEL_OPTIONS, MODEL_BACKENDS, normalize_model_spec
 
 log = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "socket_path": None,
     "default_model": "",
     "preload_default_model_on_startup": True,
-    "models": copy.deepcopy(HF_GPU_MODEL_OPTIONS),
+    "models": copy.deepcopy(BUILTIN_MODEL_OPTIONS),
     "gpu_asr_python": "",
     "audio_input_device": "",
     "whisper_server_binary": "",
@@ -224,31 +225,31 @@ def _normalize(cfg: dict) -> None:
 
 def _validate(cfg: dict) -> None:
     binary = cfg.get("whisper_server_binary") or ""
-    if not binary:
+    models = cfg.get("models", {}) or {}
+    normalized_models = {name: normalize_model_spec(name, raw) for name, raw in models.items()}
+    needs_whisper_binary = any(spec.get("backend") == "whisper.cpp" for spec in normalized_models.values())
+    if needs_whisper_binary and not binary:
         raise ConfigError("whisper_server_binary is required")
-    if not Path(binary).is_file() or not os.access(binary, os.X_OK):
+    if binary and (not Path(binary).is_file() or not os.access(binary, os.X_OK)):
         raise ConfigError(f"whisper_server_binary not executable: {binary}")
     default_model = cfg.get("default_model") or ""
-    models = cfg.get("models", {}) or {}
     if default_model and default_model not in models:
         log.warning("default_model %r not in models; clearing", default_model)
         cfg["default_model"] = ""
-    for name, raw in models.items():
-        spec = normalize_model_spec(name, raw)
+    for name, spec in normalized_models.items():
         backend = spec.get("backend")
         if backend == "whisper.cpp":
             path = spec.get("path") or ""
             if path and not Path(path).is_file():
                 log.warning("whisper.cpp model %r is not present: %s", name, path)
-        elif backend not in {
-            "qwen_asr",
-            "transformers_tdt",
-            "transformers_speech_seq2seq",
-            "seamless_m4t_v2",
-            "cohere_asr",
-            "nemo_asr",
-            "nemo_salm",
-        }:
+        elif backend == "external_api":
+            url = str(spec.get("api_base_url") or "").strip()
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ConfigError(f"external API model {name!r} has invalid api_base_url {url!r}")
+            if not str(spec.get("api_model") or "").strip():
+                raise ConfigError(f"external API model {name!r} is missing api_model")
+        elif backend not in MODEL_BACKENDS:
             raise ConfigError(f"model {name!r} has unsupported backend {backend!r}")
     for host_key in ("whisper_host",):
         host = cfg.get(host_key)

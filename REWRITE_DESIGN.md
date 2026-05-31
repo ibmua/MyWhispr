@@ -32,7 +32,7 @@ The daemon owns one job: get spoken audio in, get clean text out, paste it. Opti
 - No persistent audio backlog unless explicitly configured.
 - No focus-stealing overlay window. Visual indication lives in the GNOME top bar and the web UI only.
 - No unbounded keyboard grab: the daemon may grab configured keyboards only while a dictation trigger is held, and must always release on trigger release, stop, max-duration, device removal, process exit, or the hard safety timeout.
-- No outbound network traffic at runtime. No telemetry, no auto-update, no model download.
+- No outbound network traffic at runtime unless the user explicitly selects an external API model. No telemetry, no auto-update, no automatic model download.
 
 ## Recommended Technology
 
@@ -662,7 +662,7 @@ Threat model: one user on one workstation. The daemon handles audio (sensitive c
 - **Whisper server bound to `127.0.0.1` too.** `whisper_host` and `alternate_whisper_port` follow the same loopback rule. Same enforcement.
 - **Loopback is the only auth boundary.** No HTTP auth, by design, because the port is loopback-only and the threat model is one user on one machine. Off-loopback binding would need its own auth design (mutual TLS, token, or similar) and is not in scope.
 - **Remote access option (advisory).** To view the web UI from another machine, use SSH port forwarding (`ssh -L 16666:127.0.0.1:16666 user@host`). Do not change the bind address to expose the port directly.
-- **No outbound network traffic at runtime.** The daemon does not phone home, does not download models (model files are local paths in config), does not send telemetry, does not contact cloud transcription APIs. Anything making an outbound connection in the daemon is a bug. The install script may fetch a model on first install if asked, but the daemon does not.
+- **Outbound network traffic is opt-in.** The daemon does not phone home, does not download models automatically, and does not send telemetry. Cloud transcription is allowed only for configured `external_api` model cards selected by the user; those requests send the recorded WAV to the configured endpoint. The install script may fetch a model on first install if asked.
 
 ### Local privileges
 

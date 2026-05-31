@@ -218,6 +218,8 @@ class Daemon:
 
     def _config_changed(self, key: str, snapshot: dict) -> None:
         self.history.set_limit(int(snapshot.get("history_limit", 20)))
+        models = snapshot.get("models") or {}
+        self.primary_server.set_models(models)
         audio_cues = snapshot.get("audio_cues") or {}
         self.tones.configure(
             enabled=bool(audio_cues.get("enabled", True)),

@@ -99,9 +99,11 @@ class Transcriber:
                 target_model,
                 body_bytes,
                 language=language,
+                prompt=prompt,
                 cancel_event=cancel_event,
             )
             elapsed = _t.monotonic() - t0
+            elapsed = float(data.get("elapsed_seconds") or elapsed)
             raw = (data.get("text") or "").strip()
             segments = data.get("segments") or []
             cleaned = self._clean(raw, wav_bytes=wav_bytes, language=language)

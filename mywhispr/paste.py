@@ -15,9 +15,29 @@ PASTE_CHORDS = [
     ("shift+insert", SHIFT_INSERT_CHORD),
 ]
 BACKSPACE_CHORD = ["14:1", "14:0"]
+SHIFT_DOWN = "42:1"
+SHIFT_UP = "42:0"
 DEFAULT_PASTE_KEY_DELAY_MS = 18
 DEFAULT_TYPE_KEY_DELAY_MS = 0
 DEFAULT_DIRECT_TYPE_MAX_CHARS = 240
+
+_ASCII_KEYCODES = {
+    "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
+    "h": 35, "i": 23, "j": 36, "k": 37, "l": 38, "m": 50, "n": 49,
+    "o": 24, "p": 25, "q": 16, "r": 19, "s": 31, "t": 20, "u": 22,
+    "v": 47, "w": 17, "x": 45, "y": 21, "z": 44,
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8,
+    "8": 9, "9": 10, "0": 11,
+    " ": 57, "-": 12, "=": 13, "[": 26, "]": 27, "\\": 43,
+    ";": 39, "'": 40, "`": 41, ",": 51, ".": 52, "/": 53,
+}
+
+_ASCII_SHIFTED = {
+    "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
+    "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=",
+    "{": "[", "}": "]", "|": "\\", ":": ";", '"': "'", "~": "`",
+    "<": ",", ">": ".", "?": "/",
+}
 
 
 class OutputBackend(Protocol):
@@ -47,6 +67,10 @@ class LinuxWaylandYdotoolBackend:
     name = "linux-wayland-ydotool"
 
     async def type_text(self, text: str, *, delay_ms: int) -> bool:
+        if delay_ms <= 0:
+            ok = await _ydotool_type_ascii_fast(text)
+            if ok:
+                return True
         return await _ydotool_type(text, delay_ms=delay_ms)
 
     async def paste_text(
@@ -260,6 +284,37 @@ async def _ydotool_type(text: str, *, delay_ms: int | None = None) -> bool:
         log.error("ydotool type rc=%s err=%r", rc, err)
         return False
     return True
+
+
+def _ascii_key_chord(ch: str) -> list[str] | None:
+    shifted = False
+    key = ch
+    if "A" <= ch <= "Z":
+        shifted = True
+        key = ch.lower()
+    elif ch in _ASCII_SHIFTED:
+        shifted = True
+        key = _ASCII_SHIFTED[ch]
+    code = _ASCII_KEYCODES.get(key)
+    if code is None:
+        return None
+    down = f"{code}:1"
+    up = f"{code}:0"
+    if shifted:
+        return [SHIFT_DOWN, down, up, SHIFT_UP]
+    return [down, up]
+
+
+async def _ydotool_type_ascii_fast(text: str) -> bool:
+    keycodes: list[str] = []
+    for ch in text:
+        chord = _ascii_key_chord(ch)
+        if chord is None:
+            return False
+        keycodes.extend(chord)
+    if not keycodes:
+        return True
+    return await _ydotool_keys(keycodes, delay_ms=0)
 
 
 async def _wayland_clipboard_paste(

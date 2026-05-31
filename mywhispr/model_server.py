@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from .external_api_server import ExternalApiServer
 from .gpu_asr_server import GpuAsrServer
-from .model_specs import is_gpu_model, normalize_model_spec
+from .model_specs import is_external_api_model, is_gpu_model, normalize_model_spec
 from .whisper_server import WhisperServer
 
 
@@ -42,6 +43,7 @@ class ModelServer:
             idle_shutdown_seconds=idle_shutdown_seconds,
             name=f"{name}-gpu",
         )
+        self.external = ExternalApiServer(model_specs=model_specs, name=f"{name}-external")
         self._active = "whisper.cpp"
 
     @property
@@ -52,6 +54,8 @@ class ModelServer:
     def loaded_model(self) -> str | None:
         if self._active == "gpu":
             return self.gpu.loaded_model
+        if self._active == "external_api":
+            return self.external.loaded_model
         return self.whisper.loaded_model
 
     @property
@@ -60,6 +64,8 @@ class ModelServer:
             return self._last_error
         if self._active == "gpu":
             return self.gpu.last_error
+        if self._active == "external_api":
+            return self.external.last_error
         return self.whisper.last_error
 
     @last_error.setter
@@ -67,6 +73,7 @@ class ModelServer:
         self._last_error = value
         self.whisper.last_error = value
         self.gpu.last_error = value
+        self.external.last_error = value
 
     def _spec(self, model: str | None) -> dict[str, Any] | None:
         if not model or model not in self.models:
@@ -77,20 +84,38 @@ class ModelServer:
         spec = self._spec(model)
         return bool(spec and is_gpu_model(spec))
 
+    def _is_external(self, model: str | None) -> bool:
+        spec = self._spec(model)
+        return bool(spec and is_external_api_model(spec))
+
     def is_running(self) -> bool:
         if self._active == "gpu":
             return self.gpu.is_running()
+        if self._active == "external_api":
+            return self.external.is_running()
         return self.whisper.is_running()
 
     def status(self) -> dict[str, Any]:
-        active = self.gpu.status() if self._active == "gpu" else self.whisper.status()
+        if self._active == "gpu":
+            active = self.gpu.status()
+        elif self._active == "external_api":
+            active = self.external.status()
+        else:
+            active = self.whisper.status()
         return {
             **active,
             "name": self.name,
             "active_backend": self._active,
             "whisper": self.whisper.status(),
             "gpu": self.gpu.status(),
+            "external": self.external.status(),
         }
+
+    def set_models(self, model_specs: dict[str, Any]) -> None:
+        self.models = model_specs
+        self.whisper.models = model_specs
+        self.gpu.models = model_specs
+        self.external.set_models(model_specs)
 
     def set_idle_shutdown_seconds(self, seconds: float) -> None:
         self.whisper.idle_shutdown_seconds = seconds
@@ -112,10 +137,21 @@ class ModelServer:
         if self._is_gpu(target):
             if self.whisper.is_running():
                 await self.whisper.stop()
+            if self.external.is_running():
+                await self.external.stop()
             self._active = "gpu"
             return await self.gpu.ensure_ready(target)
+        if self._is_external(target):
+            if self.whisper.is_running():
+                await self.whisper.stop()
+            if self.gpu.is_running():
+                await self.gpu.stop()
+            self._active = "external_api"
+            return await self.external.ensure_ready(target)
         if self.gpu.is_running():
             await self.gpu.stop()
+        if self.external.is_running():
+            await self.external.stop()
         self._active = "whisper.cpp"
         return await self.whisper.ensure_ready(target)
 
@@ -125,21 +161,32 @@ class ModelServer:
         wav_bytes: bytes,
         *,
         language: str,
+        prompt: str = "",
         cancel_event: asyncio.Event | None = None,
     ) -> dict[str, Any]:
-        if not self._is_gpu(model):
-            raise RuntimeError(f"model {model!r} is not a GPU worker model")
-        self._active = "gpu"
-        return await self.gpu.transcribe(
-            model,
-            wav_bytes,
-            language=language,
-            cancel_event=cancel_event,
-        )
+        if self._is_gpu(model):
+            self._active = "gpu"
+            return await self.gpu.transcribe(
+                model,
+                wav_bytes,
+                language=language,
+                cancel_event=cancel_event,
+            )
+        if self._is_external(model):
+            self._active = "external_api"
+            return await self.external.transcribe(
+                model,
+                wav_bytes,
+                language=language,
+                prompt=prompt,
+                cancel_event=cancel_event,
+            )
+        raise RuntimeError(f"model {model!r} is not a routed worker model")
 
     async def stop(self) -> None:
         await self.whisper.stop()
         await self.gpu.stop()
+        await self.external.stop()
 
     def acquire_slot(self) -> None:
         self.whisper.acquire_slot()

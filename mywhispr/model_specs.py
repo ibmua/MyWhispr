@@ -15,6 +15,8 @@ GPU_BACKENDS = {
     "nemo_asr",
     "nemo_salm",
 }
+EXTERNAL_API_BACKENDS = {"external_api"}
+MODEL_BACKENDS = {"whisper.cpp"} | GPU_BACKENDS | EXTERNAL_API_BACKENDS
 
 
 HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
@@ -167,6 +169,42 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
     },
 }
 
+EXTERNAL_API_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
+    "gpt-4o-transcribe": {
+        "backend": "external_api",
+        "provider": "OpenAI",
+        "api_base_url": "https://api.openai.com/v1",
+        "endpoint": "/audio/transcriptions",
+        "api_model": "gpt-4o-transcribe",
+        "api_key_env": "OPENAI_API_KEY",
+        "label": "GPT-4o Transcribe",
+        "description": "External API",
+        "subdescription": "OpenAI",
+        "languages": ["en", "uk"],
+        "live_preview": False,
+        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
+    },
+    "gpt-4o-mini-transcribe": {
+        "backend": "external_api",
+        "provider": "OpenAI",
+        "api_base_url": "https://api.openai.com/v1",
+        "endpoint": "/audio/transcriptions",
+        "api_model": "gpt-4o-mini-transcribe",
+        "api_key_env": "OPENAI_API_KEY",
+        "label": "GPT-4o mini Transcribe",
+        "description": "External API",
+        "subdescription": "OpenAI mini",
+        "languages": ["en", "uk"],
+        "live_preview": False,
+        "install_hint": "Set OPENAI_API_KEY before selecting this model.",
+    },
+}
+
+BUILTIN_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
+    **HF_GPU_MODEL_OPTIONS,
+    **EXTERNAL_API_MODEL_OPTIONS,
+}
+
 
 LANGUAGE_NAMES = {
     "ar": "Arabic",
@@ -238,6 +276,16 @@ def normalize_backend(value: Any) -> str:
         return "cohere_asr"
     if backend in {"canary", "salm"}:
         return "nemo_salm"
+    if backend in {
+        "api",
+        "external",
+        "external_api",
+        "openai",
+        "openai_api",
+        "openai_compatible",
+        "openai_transcriptions",
+    }:
+        return "external_api"
     return backend
 
 
@@ -267,10 +315,20 @@ def normalize_model_spec(name: str, raw: Any) -> dict[str, Any]:
     spec.setdefault("label", name)
     spec.setdefault("description", "")
     spec.setdefault("subdescription", None)
-    spec.setdefault("live_preview", True)
+    spec.setdefault("live_preview", spec.get("backend") != "external_api")
     if spec["backend"] == "whisper.cpp" and "path" not in spec:
         spec["path"] = spec.get("model_path") or spec.get("file") or ""
-    if spec["backend"] != "whisper.cpp":
+    if spec["backend"] == "external_api":
+        spec.setdefault("provider", "External API")
+        spec.setdefault("api_base_url", spec.get("base_url") or "https://api.openai.com/v1")
+        spec.setdefault("endpoint", spec.get("api_path") or "/audio/transcriptions")
+        spec.setdefault("api_model", spec.get("model_id") or spec.get("model") or name)
+        spec.setdefault("api_key_env", "OPENAI_API_KEY")
+        spec.setdefault("api_key_required", True)
+        spec.setdefault("response_format", "json")
+        spec.setdefault("timeout_seconds", 120.0)
+        spec.setdefault("description", "External transcription API")
+    elif spec["backend"] != "whisper.cpp":
         spec.setdefault("local_files_only", True)
     return spec
 
@@ -285,8 +343,33 @@ def is_gpu_model(spec: dict[str, Any]) -> bool:
     return spec.get("backend") in GPU_BACKENDS
 
 
+def is_external_api_model(spec: dict[str, Any]) -> bool:
+    return spec.get("backend") in EXTERNAL_API_BACKENDS
+
+
 def model_source(spec: dict[str, Any]) -> str:
+    if spec.get("backend") == "external_api":
+        base = str(spec.get("api_base_url") or "").rstrip("/")
+        endpoint = str(spec.get("endpoint") or "").lstrip("/")
+        return f"{base}/{endpoint}" if base and endpoint else base or endpoint
     return str(spec.get("local_path") or spec.get("repo_id") or spec.get("path") or "")
+
+
+def external_api_key_configured(spec: dict[str, Any]) -> bool:
+    if not bool(spec.get("api_key_required", True)):
+        return True
+    if str(spec.get("api_key") or "").strip():
+        return True
+    env_name = str(spec.get("api_key_env") or "").strip()
+    if env_name and os.environ.get(env_name):
+        return True
+    key_file = str(spec.get("api_key_file") or "").strip()
+    if key_file and Path(key_file).is_file():
+        try:
+            return bool(Path(key_file).read_text().strip())
+        except OSError:
+            return False
+    return False
 
 
 def hf_cache_path(repo_id: str) -> Path:
@@ -309,6 +392,16 @@ def hf_cache_state(spec: dict[str, Any]) -> bool | None:
 
 def model_availability(spec: dict[str, Any]) -> dict[str, Any]:
     backend = spec.get("backend")
+    if backend == "external_api":
+        ok = bool(str(spec.get("api_base_url") or "").strip()) and bool(str(spec.get("api_model") or "").strip())
+        return {
+            "exists": ok,
+            "selectable": ok and external_api_key_configured(spec),
+            "cached": None,
+            "size_bytes": 0,
+            "api_key_configured": external_api_key_configured(spec),
+            "api_key_required": bool(spec.get("api_key_required", True)),
+        }
     if backend == "whisper.cpp":
         path = Path(str(spec.get("path") or ""))
         exists = path.is_file()
@@ -344,13 +437,20 @@ def public_model_card(name: str, raw: Any) -> dict[str, Any]:
         "name": name,
         "label": spec.get("label") or name,
         "backend": spec.get("backend"),
-        "path": str(spec.get("path") or spec.get("local_path") or spec.get("repo_id") or ""),
+        "path": model_source(spec),
         "repo_id": spec.get("repo_id") or "",
         "description": spec.get("description") or "",
         "subdescription": spec.get("subdescription"),
         "languages": languages,
         "install_hint": spec.get("install_hint") or "",
         "live_preview": bool(spec.get("live_preview", False)),
+        "provider": spec.get("provider") or "",
+        "api_base_url": spec.get("api_base_url") or "",
+        "endpoint": spec.get("endpoint") or "",
+        "api_model": spec.get("api_model") or "",
+        "api_key_env": spec.get("api_key_env") or "",
+        "response_format": spec.get("response_format") or "",
+        "builtin": name in BUILTIN_MODEL_OPTIONS,
     }
     card.update(available)
     return card

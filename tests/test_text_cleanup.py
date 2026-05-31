@@ -22,6 +22,11 @@ class PasteRoutingTest(unittest.TestCase):
         self.assertFalse(paste.should_direct_type("Привіт"))
         self.assertFalse(paste.should_direct_type("line one\nline two"))
 
+    def test_fast_ascii_keycodes_cover_printable_direct_type_chars(self) -> None:
+        sample = "Aa Zz 09 !@#$%^&*()_+-=[]{}\\|;:'\",.<>/?`~"
+        for ch in sample:
+            self.assertIsNotNone(paste._ascii_key_chord(ch), ch)
+
 
 class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
     async def test_short_printable_ascii_uses_type_before_clipboard(self) -> None:

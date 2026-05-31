@@ -21,6 +21,19 @@
       "description": "Fast secondary",
       "subdescription": "NVIDIA TDT"
     },
+    "gpt-4o-transcribe": {
+      "backend": "external_api",
+      "provider": "OpenAI",
+      "api_base_url": "https://api.openai.com/v1",
+      "endpoint": "/audio/transcriptions",
+      "api_model": "gpt-4o-transcribe",
+      "api_key_env": "OPENAI_API_KEY",
+      "label": "GPT-4o Transcribe",
+      "description": "External API",
+      "subdescription": "OpenAI",
+      "languages": ["en", "uk"],
+      "live_preview": false
+    },
     "turbo": {
       "backend": "whisper.cpp",
       "path": "./models/ggml-large-v3-turbo.bin",
