@@ -354,12 +354,33 @@ def _source_id_uses_us_keycodes(source_type: str, source_id: str) -> bool:
     return source_id.lower() in _FAST_TYPE_US_LAYOUTS
 
 
+def _parse_ibus_engine(raw: str) -> tuple[str, str] | None:
+    text = (raw or "").strip()
+    if not text or text.lower() in {"none", "no engine is set."}:
+        return None
+    parts = text.split(":")
+    if len(parts) < 2:
+        return None
+    source_type = parts[0].strip()
+    source_id = parts[1].strip()
+    if not source_type or not source_id:
+        return None
+    return source_type, source_id
+
+
 async def _linux_fast_type_safe_for_current_layout() -> bool:
     if sys.platform == "win32":
         return True
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
     if desktop and "gnome" not in desktop and "ubuntu" not in desktop:
         return False
+
+    # GNOME's gsettings "current" value can lag behind the visible layout under
+    # Wayland. IBus exposes the live engine on the Ubuntu/GNOME path we use.
+    ibus_engine = _parse_ibus_engine(await _command_stdout(["ibus", "engine"]))
+    if ibus_engine is not None:
+        return _source_id_uses_us_keycodes(*ibus_engine)
+
     current_raw, sources_raw = await asyncio.gather(
         _command_stdout(["gsettings", "get", "org.gnome.desktop.input-sources", "current"]),
         _command_stdout(["gsettings", "get", "org.gnome.desktop.input-sources", "sources"]),
@@ -367,6 +388,9 @@ async def _linux_fast_type_safe_for_current_layout() -> bool:
     idx = _parse_gsettings_current(current_raw)
     sources = _parse_gsettings_sources(sources_raw)
     if idx is None or idx < 0 or idx >= len(sources):
+        return False
+    if len(sources) != 1:
+        log.info("direct type disabled; multiple input sources configured but live layout is unavailable")
         return False
     source_type, source_id = sources[idx]
     return _source_id_uses_us_keycodes(source_type, source_id)

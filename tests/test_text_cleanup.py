@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from mywhispr import paste
 from mywhispr import text_cleanup
@@ -34,8 +35,38 @@ class PasteRoutingTest(unittest.TestCase):
         self.assertTrue(paste._source_id_uses_us_keycodes(*sources[0]))
         self.assertFalse(paste._source_id_uses_us_keycodes(*sources[1]))
 
+    def test_ibus_engine_parsing_gates_fast_type(self) -> None:
+        self.assertEqual(paste._parse_ibus_engine("xkb:us::eng"), ("xkb", "us"))
+        self.assertEqual(paste._parse_ibus_engine("xkb:ua::ukr"), ("xkb", "ua"))
+        self.assertTrue(paste._source_id_uses_us_keycodes(*paste._parse_ibus_engine("xkb:us::eng")))
+        self.assertFalse(paste._source_id_uses_us_keycodes(*paste._parse_ibus_engine("xkb:ua::ukr")))
+
 
 class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
+    async def test_layout_gate_uses_live_ibus_engine(self) -> None:
+        async def fake_command(args, *, timeout=0.5):
+            if args == ["ibus", "engine"]:
+                return "xkb:ua::ukr"
+            raise AssertionError(f"unexpected command {args}")
+
+        with patch.dict(paste.os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}):
+            with patch.object(paste, "_command_stdout", fake_command):
+                self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
+
+    async def test_layout_gate_fails_closed_when_only_stale_gsettings_exists(self) -> None:
+        async def fake_command(args, *, timeout=0.5):
+            if args == ["ibus", "engine"]:
+                return ""
+            if args == ["gsettings", "get", "org.gnome.desktop.input-sources", "current"]:
+                return "uint32 0"
+            if args == ["gsettings", "get", "org.gnome.desktop.input-sources", "sources"]:
+                return "[('xkb', 'us'), ('xkb', 'ua+winkeys')]"
+            raise AssertionError(f"unexpected command {args}")
+
+        with patch.dict(paste.os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}):
+            with patch.object(paste, "_command_stdout", fake_command):
+                self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
+
     async def test_short_printable_ascii_uses_type_before_clipboard(self) -> None:
         calls: list[tuple[str, str, int | None]] = []
 
