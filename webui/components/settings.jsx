@@ -153,45 +153,49 @@ function TranscriptionApiShare({ config, shareConfig, onWrite, onCopy }) {
         </div>
         <Toggle on={enabled} onChange={setEnabled} accent />
       </div>
-      <div className="share-api-grid">
-        <label>
-          <span>Bind host</span>
-          <input value={hostDraft} onChange={(e) => setHostDraft(e.target.value)}
-            onBlur={() => onWrite("transcription_api.host", hostDraft.trim() || "0.0.0.0")} />
-        </label>
-        <label>
-          <span>Port</span>
-          <input value={portDraft} onChange={(e) => setPortDraft(e.target.value.replace(/[^0-9]/g, ""))}
-            onBlur={commitPort} />
-        </label>
-        <label>
-          <span>Advertise host</span>
-          <input value={advertisedDraft} onChange={(e) => setAdvertisedDraft(e.target.value)}
-            onBlur={() => onWrite("transcription_api.advertised_host", advertisedDraft.trim())}
-            placeholder="auto LAN IP" />
-        </label>
-        <label>
-          <span>Client model name</span>
-          <input value={api.model_name || "remote-large-q5"}
-            onChange={(e) => onWrite("transcription_api.model_name", e.target.value)} />
-        </label>
-        <label className="span-2">
-          <span>API key</span>
-          <div className="share-key-row">
-            <input type="password" value={keyDraft} onChange={(e) => setKeyDraft(e.target.value)}
-              onBlur={commitKey} placeholder={api.api_key ? "configured" : "required before enabling"} />
-            <button className="btn sm ghost" onClick={generateKey}>Generate</button>
+      {enabled && (
+        <>
+          <div className="share-api-grid">
+            <label>
+              <span>Bind host</span>
+              <input value={hostDraft} onChange={(e) => setHostDraft(e.target.value)}
+                onBlur={() => onWrite("transcription_api.host", hostDraft.trim() || "0.0.0.0")} />
+            </label>
+            <label>
+              <span>Port</span>
+              <input value={portDraft} onChange={(e) => setPortDraft(e.target.value.replace(/[^0-9]/g, ""))}
+                onBlur={commitPort} />
+            </label>
+            <label>
+              <span>Advertise host</span>
+              <input value={advertisedDraft} onChange={(e) => setAdvertisedDraft(e.target.value)}
+                onBlur={() => onWrite("transcription_api.advertised_host", advertisedDraft.trim())}
+                placeholder="auto LAN IP" />
+            </label>
+            <label>
+              <span>Client model name</span>
+              <input value={api.model_name || "remote-large-q5"}
+                onChange={(e) => onWrite("transcription_api.model_name", e.target.value)} />
+            </label>
+            <label className="span-2">
+              <span>API key</span>
+              <div className="share-key-row">
+                <input type="password" value={keyDraft} onChange={(e) => setKeyDraft(e.target.value)}
+                  onBlur={commitKey} placeholder={api.api_key ? "configured" : "required before enabling"} />
+                <button className="btn sm ghost" onClick={generateKey}>Generate</button>
+              </div>
+            </label>
           </div>
-        </label>
-      </div>
-      {modelJson && (
-        <div className="share-json-wrap">
-          <div className="share-json-head">
-            <span>Client JSON</span>
-            <button className="btn sm ghost" onClick={() => onCopy(modelJson)}>Copy JSON</button>
-          </div>
-          <pre className="share-json">{modelJson}</pre>
-        </div>
+          {modelJson && (
+            <div className="share-json-wrap">
+              <div className="share-json-head">
+                <span>Client JSON</span>
+                <button className="btn sm ghost" onClick={() => onCopy(modelJson)}>Copy JSON</button>
+              </div>
+              <pre className="share-json">{modelJson}</pre>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

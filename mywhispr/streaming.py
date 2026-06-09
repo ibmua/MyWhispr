@@ -38,6 +38,7 @@ class StreamingSession:
         on_preview,
         loop: asyncio.AbstractEventLoop,
         app_output_allowed_provider=None,
+        text_transform_provider=None,
     ) -> None:
         self.config = config
         self.transcriber = transcriber
@@ -46,6 +47,7 @@ class StreamingSession:
         self.app_output_allowed_provider = app_output_allowed_provider or (lambda: True)
         self.wav_provider = wav_provider
         self.on_preview = on_preview
+        self.text_transform_provider = text_transform_provider or (lambda text: text)
         self.loop = loop
         self.task: asyncio.Task | None = None
         self.cancel = asyncio.Event()
@@ -185,7 +187,7 @@ class StreamingSession:
             return
         if generation != self._language_generation:
             return
-        text = text_cleanup.collapse_whitespace(res.text)
+        text = self.text_transform_provider(text_cleanup.collapse_whitespace(res.text))
         self.latest_preview = text
         try:
             self.on_preview(text)
@@ -287,7 +289,7 @@ class StreamingSession:
         rewrite_conf = int(s.get("rewrite_backspace_confirmations", 2))
         if not self._pause_gate_open(wav):
             return
-        stable = self._stable_text(res, wav)
+        stable = self.text_transform_provider(self._stable_text(res, wav))
         stable = self._apply_frozen_prefix(stable)
         if not stable:
             return

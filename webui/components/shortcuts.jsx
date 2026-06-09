@@ -24,9 +24,42 @@ const LETTER_CODES = { A:30,B:48,C:46,D:32,E:18,F:33,G:34,H:35,I:23,J:36,K:37,L:
 for (const L of Object.keys(LETTER_CODES)) DOM_KEY_TO_EVDEV["Key" + L] = { label: L, binding: L.toLowerCase(), keycode: LETTER_CODES[L] };
 for (let f = 1; f <= 12; f += 1) DOM_KEY_TO_EVDEV["F" + f] = { label: "F" + f, binding: "F" + f, keycode: f <= 10 ? f + 58 : (f === 11 ? 87 : 88) };
 
+function cleanShortcutKeys(arr, modes) {
+  const modeMap = modes || {};
+  return (arr || []).map(k => {
+    const mode = k.short_mode && modeMap[k.short_mode] ? modeMap[k.short_mode] : {};
+    const type = k.type || k.kind || "language";
+    return {
+      code: Number(k.code),
+      binding: k.binding,
+      label: k.label,
+      type,
+      language: k.language || mode.language || k.switch_language || (type === "language" ? k.short_mode : "") || "auto",
+      command: k.command || mode.command || "",
+    };
+  }).filter(k => Number.isFinite(k.code) && k.code > 0);
+}
+
+function cloneShortcutKeys(arr) {
+  return cleanShortcutKeys(arr).map(k => ({ ...k }));
+}
+
+function shortcutSignature(entry) {
+  if (!entry) return "";
+  return JSON.stringify({
+    code: Number(entry.code),
+    binding: entry.binding || "",
+    label: entry.label || "",
+    type: entry.type || "language",
+    language: entry.language || "auto",
+    command: entry.command || "",
+  });
+}
+
 function ModifierRow({ m, langName, onEdit, onDelete }) {
   const isScript = m.kind === "script";
   const isNostream = m.kind === "nostream";
+  const isLowercase = m.kind === "lowercase_initial";
   return (
     <div className="modifier-row" onClick={onEdit} role="button">
       <span className="kbd">`</span>
@@ -34,7 +67,12 @@ function ModifierRow({ m, langName, onEdit, onDelete }) {
       <span className="kbd" style={{ minWidth: 32 }}>{m.keyLabel || "?"}</span>
       <span className="sc-arrow">→</span>
       <span className="modifier-target">
-        {isNostream ? (
+        {isLowercase ? (
+          <>
+            <span className="muted" style={{ fontSize: 11 }}>make first letter</span>{" "}
+            <span style={{ color: "var(--text)" }}>lowercase</span>
+          </>
+        ) : isNostream ? (
           <>
             <span className="muted" style={{ fontSize: 11 }}>switch to</span>{" "}
             <span style={{ color: "var(--text)" }}>non-streaming</span>
@@ -67,27 +105,94 @@ function ModifierRow({ m, langName, onEdit, onDelete }) {
   );
 }
 
-function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete, onClose }) {
+function ModifierEditModal({ initial, existingKeys, languages, onAutosave, onDelete, onRevert, onDone }) {
   const isNew = !initial;
   const [keyInfo, setKeyInfo] = useState(initial ? {
     label: initial.keyLabel,
     binding: initial.binding,
     code: initial.code,
   } : null);
-  const [kind, setKind] = useState(initial?.kind === "nostream" ? "nostream" : initial?.kind === "script" ? "script" : "lang");
+  const [kind, setKind] = useState(
+    initial?.kind === "nostream" ? "nostream" :
+    initial?.kind === "lowercase_initial" ? "lowercase_initial" :
+    initial?.kind === "script" ? "script" :
+    "lang"
+  );
   const [langCode, setLangCode] = useState(initial?.kind === "lang" ? (initial.language || "en") : "en");
+  const [scriptLanguage] = useState(initial?.kind === "script" ? (initial.language || "auto") : "auto");
   const [scriptCmd, setScriptCmd] = useState(initial?.kind === "script" ? (initial.command || "") : "");
   const [capturing, setCapturing] = useState(isNew && !initial?.keyLabel);
   const [conflict, setConflict] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+  const [saveError, setSaveError] = useState("");
+  const saveTimer = useRef(null);
+  const pendingSave = useRef(null);
+  const drainPromise = useRef(null);
+  const mounted = useRef(true);
+  const lastSubmitted = useRef(initial ? shortcutSignature({
+    code: initial.code,
+    binding: initial.binding,
+    label: initial.keyLabel,
+    type: initial.kind === "lang" ? "language" : initial.kind,
+    language: initial.kind === "lang" || initial.kind === "script" ? (initial.language || "auto") : "auto",
+    command: initial.command || "",
+  }) : "");
+
+  const buildEntry = useCallback(() => {
+    if (!keyInfo) return null;
+    if (kind === "script" && !scriptCmd.trim()) return null;
+    const type = kind === "lang" ? "language" : kind === "script" ? "script" : kind;
+    return {
+      code: keyInfo.code,
+      binding: keyInfo.binding,
+      label: keyInfo.label,
+      type,
+      language: kind === "lang" ? langCode : kind === "script" ? scriptLanguage : "auto",
+      command: kind === "script" ? scriptCmd.trim() : "",
+    };
+  }, [keyInfo, kind, langCode, scriptLanguage, scriptCmd]);
+
+  const drainSaves = useCallback(() => {
+    if (drainPromise.current) return drainPromise.current;
+    drainPromise.current = (async () => {
+      if (mounted.current) {
+        setSaveState("saving");
+        setSaveError("");
+      }
+      try {
+        while (pendingSave.current) {
+          const next = pendingSave.current;
+          pendingSave.current = null;
+          const ok = await onAutosave(next);
+          if (!ok) {
+            if (mounted.current) {
+              setSaveState("error");
+              setSaveError("Save failed");
+            }
+            return false;
+          }
+          lastSubmitted.current = shortcutSignature(next);
+        }
+        if (mounted.current) setSaveState("saved");
+        return true;
+      } finally {
+        drainPromise.current = null;
+      }
+    })();
+    return drainPromise.current;
+  }, [onAutosave]);
+
+  const queueSave = useCallback((entry) => {
+    pendingSave.current = entry;
+    return drainSaves();
+  }, [drainSaves]);
 
   useEffect(() => {
-    const onKey = (e) => {
-      if (capturing) return;
-      if (e.key === "Escape") onClose();
+    return () => {
+      mounted.current = false;
+      if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, capturing]);
+  }, []);
 
   useEffect(() => {
     if (!capturing) return;
@@ -97,9 +202,7 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
       if (e.key === "Escape") { setCapturing(false); return; }
       const info = DOM_KEY_TO_EVDEV[e.code];
       if (!info) return;
-      const taken = existingKeys.find(
-        k => k.binding === info.binding && (!initial || k.binding !== initial.binding)
-      );
+      const taken = existingKeys.find(k => k.binding === info.binding);
       if (taken) {
         setConflict(info.label);
         setCapturing(false);
@@ -111,35 +214,80 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [capturing, existingKeys, initial]);
+  }, [capturing, existingKeys]);
 
-  const canSave = !!keyInfo && (
-    kind === "lang" ? !!langCode :
-    kind === "script" ? !!scriptCmd.trim() :
-    true
-  );
+  const draftEntry = buildEntry();
+  const canSave = !!draftEntry;
+  const draftSignature = draftEntry ? shortcutSignature(draftEntry) : "";
 
-  const handleSave = () => {
-    if (!keyInfo) { setCapturing(true); return; }
-    if (!canSave) return;
-    const type = kind === "lang" ? "language" : kind === "script" ? "script" : "nostream";
-    onSave({
-      code: keyInfo.code,
-      binding: keyInfo.binding,
-      label: keyInfo.label,
-      type,
-      language: kind === "lang" ? langCode : "auto",
-      command: kind === "script" ? scriptCmd.trim() : "",
-    });
+  useEffect(() => {
+    if (!draftEntry) return undefined;
+    if (draftSignature === lastSubmitted.current) return undefined;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    setSaveState("pending");
+    setSaveError("");
+    saveTimer.current = setTimeout(() => {
+      queueSave(draftEntry);
+    }, kind === "script" ? 520 : 180);
+    return () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+    };
+  }, [draftSignature, kind, queueSave]);
+
+  const handleDone = useCallback(async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    const entry = buildEntry();
+    if (entry && shortcutSignature(entry) !== lastSubmitted.current) {
+      const ok = await queueSave(entry);
+      if (!ok) return;
+    } else if (drainPromise.current) {
+      const ok = await drainPromise.current;
+      if (!ok) return;
+    }
+    onDone();
+  }, [buildEntry, queueSave, onDone]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (capturing) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        handleDone();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleDone, capturing]);
+
+  const handleRevert = async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    pendingSave.current = null;
+    setSaveState("saving");
+    setSaveError("");
+    if (drainPromise.current) {
+      await drainPromise.current;
+    }
+    const ok = await onRevert();
+    if (!ok && mounted.current) {
+      setSaveState("error");
+      setSaveError("Revert failed");
+    }
+  };
+
+  const handleDelete = async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    pendingSave.current = null;
+    if (drainPromise.current) await drainPromise.current;
+    onDelete();
   };
 
   return ReactDOM.createPortal(
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" onClick={handleDone}>
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
         <div className="modal-head">
           <div className="modal-title">{isNew ? "Add shortcut" : "Edit shortcut"}</div>
           <div className="card-spacer"></div>
-          <button className="btn icon ghost sm" onClick={onClose}><Icon.X /></button>
+          <button className="btn icon ghost sm" onClick={handleDone}><Icon.X /></button>
         </div>
 
         <div className="modal-body">
@@ -177,6 +325,7 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
             <div className="seg-control">
               <button className={`seg ${kind === "lang" ? "on" : ""}`} onClick={() => setKind("lang")}>Language</button>
               <button className={`seg ${kind === "script" ? "on" : ""}`} onClick={() => setKind("script")}>Script</button>
+              <button className={`seg ${kind === "lowercase_initial" ? "on" : ""}`} onClick={() => setKind("lowercase_initial")}>Lowercase</button>
               <button className={`seg ${kind === "nostream" ? "on" : ""}`} onClick={() => setKind("nostream")}>Non-Streaming</button>
             </div>
           </div>
@@ -210,6 +359,22 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
                 Receives the transcript on stdin. Stdout is treated as the replacement transcript.
               </div>
             </div>
+          ) : kind === "lowercase_initial" ? (
+            <div className="edit-field">
+              <label className="edit-label">Session modifier</label>
+              <div className="nostream-card">
+                <div className="nostream-card-head">
+                  <span className="kbd">`</span>
+                  <span className="sc-plus">+</span>
+                  <span className="kbd" style={{ minWidth: 36 }}>{keyInfo?.label || "…"}</span>
+                  <span className="sc-arrow">→</span>
+                  <span className="nostream-tag">lowercase first letter</span>
+                </div>
+                <div className="edit-hint" style={{ marginTop: 8 }}>
+                  Tap this key mid-session to make the first cased letter lowercase in live output and the final pasted transcript. It uses Unicode casing, so Ukrainian and other alphabets are handled without ASCII-only rules.
+                </div>
+              </div>
+            </div>
           ) : (
             <div className="edit-field">
               <label className="edit-label">Session modifier</label>
@@ -231,12 +396,18 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
 
         <div className="modal-foot">
           {!isNew && (
-            <button className="btn sm danger" onClick={onDelete}><Icon.Trash /> Remove</button>
+            <button className="btn sm danger" onClick={handleDelete}><Icon.Trash /> Remove</button>
           )}
+          <span className={`autosave-status ${saveState === "error" ? "error" : ""}`}>
+            {saveState === "pending" ? "Pending" :
+             saveState === "saving" ? "Saving" :
+             saveState === "saved" ? "Saved" :
+             saveState === "error" ? (saveError || "Save failed") : ""}
+          </span>
           <div className="spacer"></div>
-          <button className="btn sm ghost" onClick={onClose}>Cancel</button>
-          <button className="btn primary" onClick={handleSave} disabled={!canSave}>
-            {isNew ? "Add shortcut" : "Save"}
+          <button className="btn sm ghost" onClick={handleRevert}>Revert</button>
+          <button className="btn primary" onClick={handleDone} disabled={!canSave && isNew}>
+            Done
           </button>
         </div>
       </div>
@@ -248,7 +419,8 @@ function ModifierEditModal({ initial, existingKeys, languages, onSave, onDelete,
 function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, busy }) {
   const trig = (config && config.triggers && config.triggers[DEFAULT_TRIGGER]) || {};
   const combo = trig.combo || {};
-  const keys = combo.keys || [];
+  const modes = (config && config.modes) || {};
+  const keys = cleanShortcutKeys(combo.keys || [], modes);
   const languages = (shortcuts && shortcuts.languages) || [];
   const langName = (code) => {
     const f = languages.find(l => l.code === code);
@@ -258,13 +430,22 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
   const triggerKeyLabel = trig.binding === "grave" ? "`" : (trig.binding || "?").charAt(0).toUpperCase() + (trig.binding || "").slice(1);
 
   const [capturing, setCapturing] = useState(false);
-  const [editing, setEditing] = useState(null); // { index } or { index: null } for add
+  const [editing, setEditing] = useState(null);
+  const editingRef = useRef(null);
+
+  useEffect(() => {
+    editingRef.current = editing;
+  }, [editing]);
 
   useEffect(() => {
     if (!capturing) return undefined;
     function onKeyDown(e) {
       e.preventDefault();
       e.stopPropagation();
+      if (e.key === "Escape") {
+        setCapturing(false);
+        return;
+      }
       const info = DOM_KEY_TO_EVDEV[e.code];
       setCapturing(false);
       if (!info) return;
@@ -274,34 +455,79 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [capturing, onChangeTriggerKey]);
 
-  const cleanKeys = (arr) => arr.map(k => ({
-    code: Number(k.code),
-    binding: k.binding,
-    label: k.label,
-    type: k.type || "language",
-    language: k.language || "auto",
-    command: k.command || "",
-  })).filter(k => Number.isFinite(k.code) && k.code > 0);
+  const openEditor = (index) => {
+    const baselineKeys = cloneShortcutKeys(keys);
+    setEditing({
+      index,
+      baselineKeys,
+      currentKeys: cloneShortcutKeys(baselineKeys),
+    });
+  };
 
-  const remove = (idx) => onCommitCombo(cleanKeys(keys.filter((_, i) => i !== idx)));
+  const remove = (idx) => onCommitCombo(cleanShortcutKeys(keys.filter((_, i) => i !== idx)), { label: "Shortcut removed" });
 
-  const save = (entry) => {
-    let next;
-    if (editing.index === null) {
-      next = [...keys, entry];
+  const autosaveEditing = useCallback(async (entry) => {
+    const prev = editingRef.current;
+    if (!prev) return false;
+    const nextKeys = cloneShortcutKeys(prev.currentKeys);
+    const targetIndex = prev.index === null ? nextKeys.length : prev.index;
+    if (prev.index === null) {
+      nextKeys.push(entry);
     } else {
-      next = keys.map((k, i) => i === editing.index ? entry : k);
+      nextKeys[targetIndex] = entry;
     }
-    onCommitCombo(cleanKeys(next));
+    const nextEditing = {
+      ...prev,
+      index: targetIndex,
+      currentKeys: cloneShortcutKeys(nextKeys),
+    };
+    editingRef.current = nextEditing;
+    setEditing(nextEditing);
+    return await onCommitCombo(cleanShortcutKeys(nextKeys), {
+      silent: true,
+      errorPrefix: "Shortcut autosave failed",
+    });
+  }, [onCommitCombo]);
+
+  const revertEditing = useCallback(async () => {
+    const prev = editingRef.current;
+    if (!prev) return false;
+    const ok = await onCommitCombo(cloneShortcutKeys(prev.baselineKeys), {
+      label: "Shortcuts reverted",
+      errorPrefix: "Shortcut revert failed",
+    });
+    if (ok) {
+      editingRef.current = null;
+      setEditing(null);
+    }
+    return ok;
+  }, [onCommitCombo]);
+
+  const closeEditing = useCallback(() => {
+    editingRef.current = null;
     setEditing(null);
+  }, []);
+
+  const removeFromModal = async () => {
+    const prev = editingRef.current;
+    if (!prev || prev.index === null) {
+      closeEditing();
+      return;
+    }
+    const nextKeys = cloneShortcutKeys(prev.currentKeys).filter((_, i) => i !== prev.index);
+    const ok = await onCommitCombo(cleanShortcutKeys(nextKeys), {
+      label: "Shortcut removed",
+      errorPrefix: "Shortcut remove failed",
+    });
+    if (ok) closeEditing();
   };
 
-  const removeFromModal = () => {
-    if (editing.index !== null) remove(editing.index);
-    setEditing(null);
-  };
-
-  const existingKeys = keys.map(k => ({ binding: k.binding }));
+  const modalKey = editing && editing.index !== null ? editing.currentKeys[editing.index] : null;
+  const existingKeys = editing
+    ? editing.currentKeys
+      .map((k, i) => ({ binding: k.binding, index: i }))
+      .filter(k => k.index !== editing.index)
+    : [];
 
   return (
     <section className="card col-5">
@@ -340,7 +566,7 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
               keyLabel: k.label || k.binding,
               binding: k.binding,
               code: k.code,
-              kind: k.type === "script" ? "script" : k.type === "nostream" ? "nostream" : "language",
+              kind: k.type === "script" ? "script" : k.type === "nostream" ? "nostream" : k.type === "lowercase_initial" ? "lowercase_initial" : "language",
               language: k.language || "auto",
               command: k.command || "",
             };
@@ -349,7 +575,7 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
                 key={`${k.code}-${i}`}
                 m={m}
                 langName={langName(m.language)}
-                onEdit={() => setEditing({ index: i })}
+                onEdit={() => openEditor(i)}
                 onDelete={() => remove(i)}
               />
             );
@@ -358,7 +584,7 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
       </div>
 
       <div className="shortcuts-footer">
-        <button className="btn sm" onClick={() => setEditing({ index: null })}>
+        <button className="btn sm" onClick={() => openEditor(null)}>
           <Icon.Plus /> Add
         </button>
         <span className="muted" style={{ marginLeft: 8 }}>
@@ -368,22 +594,23 @@ function ShortcutsCard({ config, shortcuts, onCommitCombo, onChangeTriggerKey, b
 
       {editing && (
         <ModifierEditModal
-          initial={editing.index !== null ? (() => {
-            const k = keys[editing.index];
+          initial={modalKey ? (() => {
+            const k = modalKey;
             return {
               keyLabel: k.label || k.binding,
               binding: k.binding,
               code: k.code,
-              kind: k.type === "script" ? "script" : k.type === "nostream" ? "nostream" : "lang",
+              kind: k.type === "script" ? "script" : k.type === "nostream" ? "nostream" : k.type === "lowercase_initial" ? "lowercase_initial" : "lang",
               language: k.language || "auto",
               command: k.command || "",
             };
           })() : null}
           existingKeys={existingKeys}
           languages={languages}
-          onSave={save}
+          onAutosave={autosaveEditing}
           onDelete={removeFromModal}
-          onClose={() => setEditing(null)}
+          onRevert={revertEditing}
+          onDone={closeEditing}
         />
       )}
     </section>

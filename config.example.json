@@ -81,6 +81,7 @@
     "model_name": "remote-large-q5"
   },
   "history_limit": 20,
+  "stop_timeout_seconds": 3.0,
   "start_cooldown_seconds": 0.2,
   "clipboard_paste_consume_timeout_seconds": 0.8,
   "paste_key_delay_ms": 18,

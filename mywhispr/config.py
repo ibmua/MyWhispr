@@ -39,6 +39,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "history_limit": 20,
     "maximum_recording_seconds": 240,
+    "stop_timeout_seconds": 3.0,
     "start_cooldown_seconds": 0.2,
     "append_trailing_space": True,
     "require_physical_trigger_down": True,
@@ -225,6 +226,8 @@ def _normalize(cfg: dict) -> None:
         combo.setdefault("long_press_seconds", 0.5)
         keys = combo.get("keys") or []
         for key in keys:
+            if key.get("type") in {"nostream", "lowercase_initial"}:
+                continue
             if "short_mode" not in key:
                 key["short_mode"] = key.get("switch_language") or default_mode
             key["switch_language"] = language_for_mode(cfg, str(key.get("short_mode") or default_mode))

@@ -43,11 +43,23 @@ def collapse_repeated_sentences(text: str) -> str:
     return collapse_whitespace(" ".join(out))
 
 
-def finalize(text: str, *, append_trailing_space: bool) -> str:
+def lowercase_first_cased(text: str) -> str:
+    """Lowercase the first cased character without assuming an alphabet."""
+    for idx, ch in enumerate(text):
+        lowered = ch.lower()
+        uppered = ch.upper()
+        if lowered != uppered:
+            return text[:idx] + lowered + text[idx + 1 :]
+    return text
+
+
+def finalize(text: str, *, append_trailing_space: bool, lowercase_initial: bool = False) -> str:
     text = collapse_whitespace(text)
     text = collapse_repeated_sentences(text)
     if not text:
         return ""
+    if lowercase_initial:
+        text = lowercase_first_cased(text)
     if append_trailing_space:
         text = text + " "
     return text

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ SHIFT_UP = "42:0"
 DEFAULT_PASTE_KEY_DELAY_MS = 18
 DEFAULT_TYPE_KEY_DELAY_MS = 0
 DEFAULT_DIRECT_TYPE_MAX_CHARS = 240
+_CLIPBOARD_SNAPSHOT_TIMEOUT_SECONDS = 1.0
 
 _ASCII_KEYCODES = {
     "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
@@ -42,6 +44,18 @@ _ASCII_SHIFTED = {
     "<": ",", ">": ".", "?": "/",
 }
 _FAST_TYPE_US_LAYOUTS = {"us"}
+_SPECIAL_CLIPBOARD_MIME_TYPES = {
+    "TIMESTAMP",
+    "TARGETS",
+    "MULTIPLE",
+    "SAVE_TARGETS",
+}
+
+
+@dataclass(frozen=True)
+class _WaylandClipboardSnapshot:
+    mime_type: str | None
+    data: bytes = b""
 
 
 class OutputBackend(Protocol):
@@ -157,9 +171,36 @@ async def _wl_copy(text: str, *, paste_once: bool) -> bool:
 
 
 async def _start_wl_copy(text: str, *, paste_once: bool) -> asyncio.subprocess.Process | None:
+    return await _start_wl_copy_bytes(
+        text.encode("utf-8"),
+        paste_once=paste_once,
+        mime_type="text/plain;charset=utf-8",
+    )
+
+
+async def _wl_copy_bytes(
+    data: bytes,
+    *,
+    paste_once: bool,
+    mime_type: str | None = None,
+) -> bool:
+    proc = await _start_wl_copy_bytes(data, paste_once=paste_once, mime_type=mime_type)
+    if proc is None:
+        return False
+    return True
+
+
+async def _start_wl_copy_bytes(
+    data: bytes,
+    *,
+    paste_once: bool,
+    mime_type: str | None = None,
+) -> asyncio.subprocess.Process | None:
     args = ["wl-copy"]
     if paste_once:
         args.append("--paste-once")
+    if mime_type:
+        args.extend(["--type", mime_type])
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -172,7 +213,7 @@ async def _start_wl_copy(text: str, *, paste_once: bool) -> asyncio.subprocess.P
         return None
     try:
         assert proc.stdin is not None
-        proc.stdin.write(text.encode("utf-8"))
+        proc.stdin.write(data)
         await proc.stdin.drain()
         proc.stdin.close()
         try:
@@ -185,6 +226,34 @@ async def _start_wl_copy(text: str, *, paste_once: bool) -> asyncio.subprocess.P
         await proc.wait()
         return None
     return proc
+
+
+async def _wl_clear() -> bool:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "wl-copy",
+            "--clear",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.error("wl-copy not found")
+        return False
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False
+    if rc != 0:
+        try:
+            err = await proc.stderr.read(400) if proc.stderr else b""
+        except Exception:
+            err = b""
+        log.error("wl-copy --clear rc=%s err=%r", rc, err)
+        return False
+    return True
 
 
 async def _wait_wl_copy(
@@ -320,6 +389,31 @@ async def _command_stdout(args: list[str], *, timeout: float = 0.5) -> str:
     return out.decode("utf-8", "replace").strip()
 
 
+async def _command_bytes(args: list[str], *, timeout: float = 0.5) -> tuple[int | None, bytes, bytes]:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None, b"", b"not found"
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+        return None, b"", b"timeout"
+    return proc.returncode, out, err
+
+
 def _parse_gsettings_current(raw: str) -> int | None:
     matches = re.findall(r"\d+", raw or "")
     if not matches:
@@ -427,6 +521,65 @@ async def _ydotool_type_ascii_fast(text: str) -> bool:
     return await _ydotool_keys(keycodes, delay_ms=0)
 
 
+def _preferred_clipboard_mime_type(mime_types: list[str]) -> str | None:
+    types = [
+        mime_type.strip()
+        for mime_type in mime_types
+        if mime_type.strip() and mime_type.strip() not in _SPECIAL_CLIPBOARD_MIME_TYPES
+    ]
+    if not types:
+        return None
+    for preferred in ("text/plain;charset=utf-8", "text/plain"):
+        if preferred in types:
+            return preferred
+    for mime_type in types:
+        if mime_type.startswith("text/plain"):
+            return mime_type
+    return types[0]
+
+
+async def _wayland_clipboard_snapshot() -> _WaylandClipboardSnapshot | None:
+    rc, out, err = await _command_bytes(
+        ["wl-paste", "--list-types"],
+        timeout=_CLIPBOARD_SNAPSHOT_TIMEOUT_SECONDS,
+    )
+    if rc is None:
+        log.error("clipboard snapshot failed: wl-paste --list-types %r", err[:200])
+        return None
+    if rc != 0:
+        err_text = err.decode("utf-8", "replace").lower()
+        if "nothing is copied" in err_text or "no selection" in err_text:
+            return _WaylandClipboardSnapshot(mime_type=None)
+        log.error("clipboard snapshot failed: wl-paste --list-types rc=%s err=%r", rc, err[:200])
+        return None
+    if not out.strip():
+        return _WaylandClipboardSnapshot(mime_type=None)
+
+    mime_types = out.decode("utf-8", "replace").splitlines()
+    mime_type = _preferred_clipboard_mime_type(mime_types)
+    if mime_type is None:
+        return _WaylandClipboardSnapshot(mime_type=None)
+
+    rc, data, err = await _command_bytes(
+        ["wl-paste", "--no-newline", "--type", mime_type],
+        timeout=_CLIPBOARD_SNAPSHOT_TIMEOUT_SECONDS,
+    )
+    if rc is None or rc != 0:
+        log.error("clipboard snapshot failed: wl-paste --type %s rc=%s err=%r", mime_type, rc, err[:200])
+        return None
+    return _WaylandClipboardSnapshot(mime_type=mime_type, data=data)
+
+
+async def _restore_wayland_clipboard(snapshot: _WaylandClipboardSnapshot) -> bool:
+    if snapshot.mime_type is None:
+        return await _wl_clear()
+    return await _wl_copy_bytes(
+        snapshot.data,
+        paste_once=False,
+        mime_type=snapshot.mime_type,
+    )
+
+
 async def _wayland_clipboard_paste(
     text: str,
     *,
@@ -434,30 +587,36 @@ async def _wayland_clipboard_paste(
     consume_timeout: float,
     key_delay_ms: int,
 ) -> bool:
+    snapshot = await _wayland_clipboard_snapshot()
+    if snapshot is None:
+        return False
     proc = await _start_wl_copy(text, paste_once=True)
     if proc is None:
         return False
-    await asyncio.sleep(max(settle_seconds, 0.12))
-    for name, chord in PASTE_CHORDS:
-        keys_ok = await _ydotool_keys(chord, delay_ms=key_delay_ms)
-        if not keys_ok:
-            log.warning("paste chord failed chord=%s", name)
-            continue
-        consumed = await _wait_wl_copy(
-            proc,
-            timeout=max(0.05, consume_timeout),
-            kill_on_timeout=False,
-        )
-        if consumed:
-            log.info("output method=paste backend=wayland chord=%s chars=%d", name, len(text))
-            return True
-        if proc.returncode is not None:
-            return False
-        log.warning("paste chord did not consume clipboard chord=%s", name)
-
-    await _stop_wl_copy(proc)
-    await _wl_copy(text, paste_once=False)
-    return False
+    try:
+        await asyncio.sleep(max(settle_seconds, 0.12))
+        for name, chord in PASTE_CHORDS:
+            keys_ok = await _ydotool_keys(chord, delay_ms=key_delay_ms)
+            if not keys_ok:
+                log.warning("paste chord failed chord=%s", name)
+                continue
+            consumed = await _wait_wl_copy(
+                proc,
+                timeout=max(0.05, consume_timeout),
+                kill_on_timeout=False,
+            )
+            if consumed:
+                log.info("output method=paste backend=wayland chord=%s chars=%d", name, len(text))
+                return True
+            if proc.returncode is not None:
+                return False
+            log.warning("paste chord did not consume clipboard chord=%s", name)
+        return False
+    finally:
+        await _stop_wl_copy(proc)
+        restored = await _restore_wayland_clipboard(snapshot)
+        if not restored:
+            log.warning("failed to restore clipboard after paste attempt")
 
 
 _windows_types: tuple | None = None

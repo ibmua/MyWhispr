@@ -14,6 +14,21 @@ class TextCleanupTest(unittest.TestCase):
     def test_collapses_whitespace_without_phrase_rewrites(self) -> None:
         self.assertEqual(self.finalized("Token_123\nstill fails."), "Token_123 still fails.")
 
+    def test_lowercases_first_cased_letter_for_ukrainian(self) -> None:
+        self.assertEqual(text_cleanup.lowercase_first_cased("Привіт, світе."), "привіт, світе.")
+
+    def test_lowercases_first_cased_letter_after_punctuation(self) -> None:
+        self.assertEqual(text_cleanup.lowercase_first_cased("«Hello there»"), "«hello there»")
+
+    def test_lowercase_initial_finalize_keeps_trailing_space_option(self) -> None:
+        self.assertEqual(
+            text_cleanup.finalize("  Доброго дня.  ", append_trailing_space=True, lowercase_initial=True),
+            "доброго дня. ",
+        )
+
+    def test_lowercase_first_cased_leaves_uncased_text_alone(self) -> None:
+        self.assertEqual(text_cleanup.lowercase_first_cased("123 ..."), "123 ...")
+
 
 class PasteRoutingTest(unittest.TestCase):
     def test_direct_type_is_generic_for_short_printable_ascii(self) -> None:
@@ -95,6 +110,107 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(ok)
         self.assertEqual(calls, [("type", "Alpha beta ", 0)])
+
+    async def test_wayland_clipboard_paste_restores_original_after_success(self) -> None:
+        calls: list[tuple] = []
+
+        class FakeProc:
+            returncode: int | None = None
+
+        proc = FakeProc()
+        snapshot = paste._WaylandClipboardSnapshot("text/plain;charset=utf-8", b"old clipboard")
+
+        async def fake_snapshot():
+            calls.append(("snapshot",))
+            return snapshot
+
+        async def fake_start(text: str, *, paste_once: bool):
+            calls.append(("start", text, paste_once))
+            return proc
+
+        async def fake_keys(_chord, *, delay_ms: int | None = None):
+            calls.append(("keys", delay_ms))
+            return True
+
+        async def fake_wait(wait_proc, *, timeout: float, kill_on_timeout: bool = True):
+            self.assertIs(wait_proc, proc)
+            calls.append(("wait", timeout, kill_on_timeout))
+            proc.returncode = 0
+            return True
+
+        async def fake_stop(stop_proc):
+            self.assertIs(stop_proc, proc)
+            calls.append(("stop", proc.returncode))
+
+        async def fake_restore(restore_snapshot):
+            calls.append(("restore", restore_snapshot.mime_type, restore_snapshot.data))
+            return True
+
+        with patch.object(paste, "_wayland_clipboard_snapshot", fake_snapshot):
+            with patch.object(paste, "_start_wl_copy", fake_start):
+                with patch.object(paste, "_ydotool_keys", fake_keys):
+                    with patch.object(paste, "_wait_wl_copy", fake_wait):
+                        with patch.object(paste, "_stop_wl_copy", fake_stop):
+                            with patch.object(paste, "_restore_wayland_clipboard", fake_restore):
+                                ok = await paste._wayland_clipboard_paste(
+                                    "new transcript",
+                                    settle_seconds=0,
+                                    consume_timeout=0.2,
+                                    key_delay_ms=18,
+                                )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls[-1], ("restore", "text/plain;charset=utf-8", b"old clipboard"))
+
+    async def test_wayland_clipboard_paste_restores_original_after_failure(self) -> None:
+        calls: list[tuple] = []
+
+        class FakeProc:
+            returncode: int | None = None
+
+        proc = FakeProc()
+        snapshot = paste._WaylandClipboardSnapshot("text/plain", b"keep me")
+
+        async def fake_snapshot():
+            return snapshot
+
+        async def fake_start(_text: str, *, paste_once: bool):
+            calls.append(("start", paste_once))
+            return proc
+
+        async def fake_keys(_chord, *, delay_ms: int | None = None):
+            calls.append(("keys", delay_ms))
+            return True
+
+        async def fake_wait(_proc, *, timeout: float, kill_on_timeout: bool = True):
+            calls.append(("wait", timeout, kill_on_timeout))
+            return False
+
+        async def fake_stop(_proc):
+            proc.returncode = -15
+            calls.append(("stop",))
+
+        async def fake_restore(restore_snapshot):
+            calls.append(("restore", restore_snapshot.mime_type, restore_snapshot.data))
+            return True
+
+        with patch.object(paste, "_wayland_clipboard_snapshot", fake_snapshot):
+            with patch.object(paste, "_start_wl_copy", fake_start):
+                with patch.object(paste, "_ydotool_keys", fake_keys):
+                    with patch.object(paste, "_wait_wl_copy", fake_wait):
+                        with patch.object(paste, "_stop_wl_copy", fake_stop):
+                            with patch.object(paste, "_restore_wayland_clipboard", fake_restore):
+                                with patch.object(paste.log, "warning"):
+                                    ok = await paste._wayland_clipboard_paste(
+                                        "new transcript",
+                                        settle_seconds=0,
+                                        consume_timeout=0.2,
+                                        key_delay_ms=18,
+                                    )
+
+        self.assertFalse(ok)
+        self.assertEqual(calls.count(("keys", 18)), len(paste.PASTE_CHORDS))
+        self.assertEqual(calls[-1], ("restore", "text/plain", b"keep me"))
 
 
 if __name__ == "__main__":

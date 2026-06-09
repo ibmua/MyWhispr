@@ -1573,6 +1573,12 @@ input, select, textarea { font-family: inherit; color: inherit; }
   font-size: 12px; cursor: pointer; padding: 4px 8px; border-radius: 4px;
 }
 .link-btn:hover { background: var(--info-soft); }
+.autosave-status {
+  min-width: 54px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.autosave-status.error { color: var(--danger); }
 
 .seg-control {
   display: inline-flex;

@@ -12,6 +12,7 @@ from typing import Any
 
 from . import audio_sources
 from . import paste as paste_mod
+from . import text_cleanup
 from .config import Config, language_for_mode, mode_config
 from .control import ControlSocketServer
 from .history import History, HistoryItem
@@ -109,6 +110,7 @@ class Daemon:
         self._grab_safety_task: asyncio.Task | None = None
         self._combo_active: bool = False
         self._max_duration_task: asyncio.Task | None = None
+        self._stop_watchdog_task: asyncio.Task | None = None
         self._warm_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._physical_start_task: asyncio.Task | None = None
@@ -119,6 +121,7 @@ class Daemon:
         self._last_preview_text: str = ""
         self._error_message: str = ""
         self._session_nostream: bool = False
+        self._session_lowercase_initial: bool = False
         self._pressed_keycodes: set[int] = set()
         self._last_key_down_at: dict[int, float] = {}
         self._last_key_up_at: dict[int, float] = {}
@@ -355,6 +358,9 @@ class Daemon:
                         self._combo_key_down_at[ev.code] = time.monotonic()
                         if k.get("type") == "nostream":
                             self.post(Event.NOSTREAM)
+                            return
+                        if k.get("type") == "lowercase_initial":
+                            self.post(Event.LOWERCASE_INITIAL)
                             return
                         mode = k.get("short_mode") or k.get("switch_language")
                         self.post(Event.COMBO, mode=mode, switch_language=k.get("switch_language"))
@@ -644,6 +650,13 @@ class Daemon:
                     "label": label,
                     "type": "nostream",
                 })
+            elif kind == "lowercase_initial":
+                normalized_keys.append({
+                    "code": code,
+                    "binding": binding,
+                    "label": label,
+                    "type": "lowercase_initial",
+                })
             else:
                 normalized_keys.append({
                     "code": code,
@@ -689,6 +702,15 @@ class Daemon:
     def status_snapshot(self) -> dict:
         recent = self.history.list()
         last_text = recent[0].text if recent else ""
+        recent_transcripts = [
+            {
+                "id": item.id,
+                "created_at": item.created_at,
+                "text": item.text,
+            }
+            for item in recent
+            if item.text.strip()
+        ][:2]
         return {
             "state": self.state.value,
             "pid": self.pid,
@@ -702,6 +724,7 @@ class Daemon:
             "primary_server": self.primary_server.status(),
             "live_preview": self._last_preview_text if self.state == State.RECORDING else "",
             "last_transcript": last_text,
+            "recent_transcripts": recent_transcripts,
             "history_count": len(recent),
             "retranslate": self.retranslator.state,
             "error": self._error_message,
@@ -710,6 +733,7 @@ class Daemon:
             "topbar": self.config.get("topbar") or {},
             "audio_input_device": self.config.get("audio_input_device") or "",
             "session_nostream": self._session_nostream,
+            "session_lowercase_initial": self._session_lowercase_initial,
             "transcription_api": {
                 **(self.config.get("transcription_api") or {}),
                 "running": self.transcription_api_runner is not None,
@@ -767,6 +791,51 @@ class Daemon:
         if self._max_duration_task and not self._max_duration_task.done():
             self._max_duration_task.cancel()
         self._max_duration_task = None
+
+    def _arm_stop_watchdog(self, reason: str) -> None:
+        if self._stop_watchdog_task and not self._stop_watchdog_task.done():
+            self._stop_watchdog_task.cancel()
+        timeout = float(self.config.get("stop_timeout_seconds", 3.0))
+        if timeout <= 0:
+            self._stop_watchdog_task = None
+            return
+
+        async def _fire() -> None:
+            try:
+                await asyncio.sleep(timeout)
+                if self.state not in (State.STOPPING, State.STOPPING_NO_PASTE):
+                    return
+                log.error(
+                    "stop watchdog fired state=%s reason=%s timeout_seconds=%.3f recorder_running=%s",
+                    self.state.value,
+                    reason,
+                    timeout,
+                    self.recorder.is_running(),
+                )
+                self._deactivate_combo("stop-watchdog")
+                self._cancel_max_duration_timer()
+                if self._stream is not None:
+                    try:
+                        await asyncio.wait_for(self._stream.stop(), timeout=1.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("stream stop failed in stop watchdog")
+                try:
+                    await self.recorder.stop()
+                except Exception:
+                    log.exception("recorder stop failed in stop watchdog")
+                self.post(Event.RECORDER_STOPPED)
+            except asyncio.CancelledError:
+                return
+
+        self._stop_watchdog_task = asyncio.create_task(_fire())
+
+    def _cancel_stop_watchdog(self) -> None:
+        task = self._stop_watchdog_task
+        self._stop_watchdog_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     def _activate_combo(self, trigger: str) -> None:
         triggers = self.config.get("triggers") or {}
@@ -836,6 +905,7 @@ def _clear_current_recording(d: Daemon) -> None:
     d._current_mode_config = {}
     d._current_language = ""
     d._combo_key_down_at.clear()
+    d._session_lowercase_initial = False
     if d._combo_long_task and not d._combo_long_task.done():
         d._combo_long_task.cancel()
     d._release_requested_while_starting = False
@@ -899,6 +969,7 @@ async def _handle_start_from_idle(d: Daemon, *, trigger: str) -> State:
     d._error_message = ""
     d._release_requested_while_starting = False
     d._session_nostream = False
+    d._session_lowercase_initial = False
 
     # Start cue FIRST.
     d.tones.play_start()
@@ -962,6 +1033,7 @@ async def _start_recording_effect(d: Daemon, trigger: str) -> None:
             on_preview=on_preview,
             loop=asyncio.get_event_loop(),
             app_output_allowed_provider=lambda: _mode_allows_app_output(d),
+            text_transform_provider=lambda text: _apply_session_text_transform(d, text),
         )
         d._stream.start()
     d.post(Event.RECORDER_READY)
@@ -993,6 +1065,10 @@ async def _handle_release_starting(d: Daemon, *, trigger: str | None = None) -> 
     d._cancel_max_duration_timer()
     if d._stream is not None:
         await d._stream.stop()
+    if d.recorder.is_running():
+        await d.recorder.stop()
+        d.post(Event.RECORDER_STOPPED)
+    d._arm_stop_watchdog("release-starting")
     return State.STOPPING
 
 
@@ -1004,6 +1080,7 @@ async def _handle_release_recording(d: Daemon, *, trigger: str) -> State:
         await d._stream.stop()
     await d.recorder.stop()
     d.post(Event.RECORDER_STOPPED)
+    d._arm_stop_watchdog("release")
     return State.STOPPING
 
 
@@ -1031,6 +1108,23 @@ async def _handle_nostream(d: Daemon) -> State:
     return d.state
 
 
+def _apply_session_text_transform(d: Daemon, text: str) -> str:
+    if d._session_lowercase_initial:
+        return text_cleanup.lowercase_first_cased(text)
+    return text
+
+
+async def _handle_lowercase_initial(d: Daemon) -> State:
+    if d._session_lowercase_initial:
+        return d.state
+    d._session_lowercase_initial = True
+    log.info("session first letter lowercasing enabled via modifier")
+    if d._stream is not None:
+        d._last_preview_text = _apply_session_text_transform(d, d._last_preview_text)
+        d._stream.language_switched()
+    return d.state
+
+
 async def _handle_max_duration(d: Daemon) -> State:
     log.warning("max duration hit")
     d.tones.play_stop()
@@ -1040,6 +1134,7 @@ async def _handle_max_duration(d: Daemon) -> State:
         await d._stream.stop()
     await d.recorder.stop()
     d.post(Event.RECORDER_STOPPED)
+    d._arm_stop_watchdog("max_duration")
     return State.STOPPING_NO_PASTE
 
 
@@ -1051,6 +1146,7 @@ async def _handle_recorder_exited_error(d: Daemon) -> State:
     if d._stream is not None:
         await d._stream.stop()
     d.post(Event.RECORDER_STOPPED)
+    d._arm_stop_watchdog("recorder_exit")
     return State.STOPPING_NO_PASTE
 
 
@@ -1062,15 +1158,28 @@ async def _handle_stop_recording(d: Daemon) -> State:
         await d._stream.stop()
     await d.recorder.stop()
     d.post(Event.RECORDER_STOPPED)
+    d._arm_stop_watchdog("stop")
+    return State.STOPPING
+
+
+async def _handle_recorder_ready_while_stopping(d: Daemon) -> State:
+    log.warning("recorder became ready after stop was requested; stopping immediately")
+    if d._stream is not None:
+        await d._stream.stop()
+    if d.recorder.is_running():
+        await d.recorder.stop()
+        d.post(Event.RECORDER_STOPPED)
     return State.STOPPING
 
 
 async def _handle_recorder_stopped(d: Daemon) -> State:
+    d._cancel_stop_watchdog()
     asyncio.create_task(_transcribe_and_paste(d, paste_allowed=True))
     return State.TRANSCRIBING
 
 
 async def _handle_recorder_stopped_nopaste(d: Daemon) -> State:
+    d._cancel_stop_watchdog()
     asyncio.create_task(_transcribe_and_paste(d, paste_allowed=False))
     return State.TRANSCRIBING_NO_PASTE
 
@@ -1273,13 +1382,14 @@ async def _transcribe_and_paste(d: Daemon, *, paste_allowed: bool) -> None:
     d.recorder.cleanup()
     generation_ms = max(0, int(round(res.elapsed_seconds * 1000)))
     script_result = None
+    text = _apply_session_text_transform(d, res.text)
     if (mode_cfg.get("type") == "script") and res.text:
         paste_allowed = False
         script_result = await _run_script_mode(
             d,
             mode=mode,
             mode_cfg=mode_cfg,
-            text=res.text,
+            text=text,
             raw=res.raw_text,
             language=language,
             model=res.model,
@@ -1289,7 +1399,7 @@ async def _transcribe_and_paste(d: Daemon, *, paste_allowed: bool) -> None:
     d.post(
         Event.TRANSCRIPT_READY,
         paste_allowed=paste_allowed,
-        text=res.text,
+        text=text,
         raw=res.raw_text,
         model=res.model,
         language=language,
@@ -1315,10 +1425,8 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
         max_rewrite = int((d.config.get("streaming") or {}).get("max_rewrite_chars", 180))
         diverge = d._stream.divergence_from_final(text) if d._stream else 0
         if diverge > max_rewrite:
-            # Refuse destructive rewrite; leave clipboard with full text, no paste.
+            # Refuse destructive rewrite without replacing the user's clipboard.
             log.warning("final divergence %d > %d; refusing rewrite", diverge, max_rewrite)
-            # Stash final on clipboard for manual paste.
-            await paste_mod.copy_text(text)
             d.tones.play_error()
             d.post(Event.PASTE_DONE, item_id=item.id, ok=False)
             return
@@ -1356,13 +1464,16 @@ TRANSITIONS: dict[tuple[State, Event], Any] = {
     (State.STARTING, Event.STOP): _handle_release_starting,
     (State.STARTING, Event.COMBO): _handle_combo_starting,
     (State.STARTING, Event.NOSTREAM): _handle_nostream,
+    (State.STARTING, Event.LOWERCASE_INITIAL): _handle_lowercase_initial,
     (State.RECORDING, Event.RELEASE): _handle_release_recording,
     (State.RECORDING, Event.COMBO): _handle_combo_recording,
     (State.RECORDING, Event.NOSTREAM): _handle_nostream,
+    (State.RECORDING, Event.LOWERCASE_INITIAL): _handle_lowercase_initial,
     (State.RECORDING, Event.MAX_DURATION): _handle_max_duration,
     (State.RECORDING, Event.RECORDER_EXITED_ERROR): _handle_recorder_exited_error,
     (State.RECORDING, Event.STOP): _handle_stop_recording,
     (State.STOPPING, Event.RECORDER_STOPPED): _handle_recorder_stopped,
+    (State.STOPPING, Event.RECORDER_READY): _handle_recorder_ready_while_stopping,
     (State.STOPPING, Event.RECORDER_FAILED): _handle_recorder_failed,
     (State.STOPPING, Event.RECORDER_EXITED_ERROR): _handle_recorder_failed,
     (State.STOPPING_NO_PASTE, Event.RECORDER_STOPPED): _handle_recorder_stopped_nopaste,

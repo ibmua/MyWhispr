@@ -1,5 +1,6 @@
 .mywhispr-label {
   margin-left: 6px;
+  margin-right: 5px;
   color: #cccccc;
 }
 
@@ -19,4 +20,68 @@
   padding: 6px 8px;
   font-family: monospace;
   max-width: 28em;
+}
+
+.mywhispr-copy-row-item {
+  padding: 6px 8px;
+}
+
+.mywhispr-copy-row {
+  spacing: 8px;
+}
+
+.mywhispr-copy-row-button {
+  min-width: 68px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background-color: rgba(255, 255, 255, 0.10);
+  color: #eef2f7;
+}
+
+.mywhispr-copy-row-button:hover {
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+.mywhispr-copy-row-button-content {
+  spacing: 5px;
+}
+
+.mywhispr-copy-row-icon {
+  icon-size: 14px;
+}
+
+.mywhispr-copy-row-button-label {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.mywhispr-copy-row-text {
+  font-family: monospace;
+  max-width: 34em;
+  color: #d6dce5;
+}
+
+.mywhispr-copy-button {
+  margin-left: 2px;
+  padding: 0 6px;
+  border-radius: 5px;
+  color: #d7dde5;
+}
+
+.mywhispr-copy-button:hover {
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+.mywhispr-copy-button-content {
+  spacing: 4px;
+}
+
+.mywhispr-copy-icon {
+  icon-size: 14px;
+}
+
+.mywhispr-copy-text {
+  font-size: 11px;
+  font-weight: 600;
+  color: #aeb7c4;
 }

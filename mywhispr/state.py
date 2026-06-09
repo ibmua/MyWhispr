@@ -22,6 +22,7 @@ class Event(enum.Enum):
     RELEASE = "release"
     COMBO = "combo"
     NOSTREAM = "nostream"
+    LOWERCASE_INITIAL = "lowercase_initial"
     MAX_DURATION = "max_duration"
     RECORDER_EXITED_ERROR = "recorder_exited_error"
     RECORDER_STOPPED = "recorder_stopped"
@@ -39,24 +40,30 @@ IGNORED_BY_DESIGN: set[tuple[State, Event]] = {
     (State.IDLE, Event.RELEASE),
     (State.IDLE, Event.COMBO),
     (State.IDLE, Event.NOSTREAM),
+    (State.IDLE, Event.LOWERCASE_INITIAL),
     (State.STARTING, Event.COMBO),
     (State.STOPPING, Event.RELEASE),
     (State.STOPPING, Event.COMBO),
     (State.STOPPING, Event.NOSTREAM),
+    (State.STOPPING, Event.LOWERCASE_INITIAL),
     (State.STOPPING_NO_PASTE, Event.RELEASE),
     (State.STOPPING_NO_PASTE, Event.COMBO),
     (State.STOPPING_NO_PASTE, Event.NOSTREAM),
+    (State.STOPPING_NO_PASTE, Event.LOWERCASE_INITIAL),
     (State.TRANSCRIBING, Event.RELEASE),
     (State.TRANSCRIBING, Event.COMBO),
     (State.TRANSCRIBING, Event.NOSTREAM),
+    (State.TRANSCRIBING, Event.LOWERCASE_INITIAL),
     (State.TRANSCRIBING, Event.START),
     (State.TRANSCRIBING_NO_PASTE, Event.RELEASE),
     (State.TRANSCRIBING_NO_PASTE, Event.COMBO),
     (State.TRANSCRIBING_NO_PASTE, Event.NOSTREAM),
+    (State.TRANSCRIBING_NO_PASTE, Event.LOWERCASE_INITIAL),
     (State.TRANSCRIBING_NO_PASTE, Event.START),
     (State.PASTING, Event.RELEASE),
     (State.PASTING, Event.COMBO),
     (State.PASTING, Event.NOSTREAM),
+    (State.PASTING, Event.LOWERCASE_INITIAL),
     (State.PASTING, Event.START),
     (State.RECORDING, Event.START),
 }

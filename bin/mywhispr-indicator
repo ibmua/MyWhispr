@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 
@@ -11,13 +14,15 @@ import gi
 gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("Gtk", "3.0")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
-from gi.repository import GLib, Gtk
+from gi.repository import Gdk, GLib, Gtk
 
 
 STATUS_URL = "http://127.0.0.1:16666/api/status"
 STOP_URL = "http://127.0.0.1:16666/api/recording/stop"
 WEB_URL = "http://127.0.0.1:16666/"
 POLL_MS = 600
+COPY_SNIPPET_CHARS = 96
+COPY_TIMEOUT_SECONDS = 1.0
 
 
 def fetch_json(url: str) -> dict:
@@ -38,6 +43,10 @@ def post_json(url: str, body: dict | None = None) -> None:
         pass
 
 
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
 def mode_marker(status: dict) -> str:
     if (status.get("current_mode_type") or "") == "script":
         return "script"
@@ -54,6 +63,54 @@ def truncate_words(text: str, max_words: int) -> str:
     if len(words) <= max_words:
         return " ".join(words)
     return "..." + " ".join(words[-max_words:])
+
+
+def menu_snippet(text: str) -> str:
+    flat = " ".join((text or "").split())
+    if len(flat) <= COPY_SNIPPET_CHARS:
+        return flat
+    return flat[: COPY_SNIPPET_CHARS - 1] + "..."
+
+
+def run_copy_command(args: list[str], text: str) -> None:
+    subprocess.run(
+        args,
+        input=text.encode("utf-8"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=COPY_TIMEOUT_SECONDS,
+        check=True,
+    )
+
+
+def copy_with_xclip(text: str) -> list[str]:
+    if shutil.which("xclip") is None or not os.environ.get("DISPLAY"):
+        return []
+
+    copied: list[str] = []
+    for selection, label in (("clipboard", "x11-clipboard"), ("primary", "x11-primary")):
+        try:
+            run_copy_command(["xclip", "-selection", selection, "-i"], text)
+            copied.append(label)
+        except Exception as e:
+            log(f"xclip {selection} failed: {e}")
+    return copied
+
+
+def copy_with_gtk(text: str) -> list[str]:
+    copied: list[str] = []
+    for selection, label in (
+        (Gdk.SELECTION_CLIPBOARD, "gtk-clipboard"),
+        (Gdk.SELECTION_PRIMARY, "gtk-primary"),
+    ):
+        try:
+            clipboard = Gtk.Clipboard.get(selection)
+            clipboard.set_text(text, -1)
+            clipboard.store()
+            copied.append(label)
+        except Exception as e:
+            log(f"{label} copy failed: {e}")
+    return copied
 
 
 def label_for_status(status: dict) -> tuple[str, str, str]:
@@ -99,6 +156,7 @@ def label_for_status(status: dict) -> tuple[str, str, str]:
 class MyWhisprIndicator:
     def __init__(self) -> None:
         self.last_text = ""
+        self.recent_texts: list[str] = []
         self.indicator = AppIndicator.Indicator.new(
             "mywhispr-indicator",
             "audio-input-microphone-symbolic",
@@ -117,15 +175,15 @@ class MyWhisprIndicator:
         self.status_item.set_sensitive(False)
         menu.append(self.status_item)
 
-        self.last_item = Gtk.MenuItem(label="No transcript yet")
-        self.last_item.set_sensitive(False)
-        menu.append(self.last_item)
+        self.copy_items = []
+        for i in range(2):
+            item = Gtk.MenuItem(label="No transcript yet" if i == 0 else "No previous transcript")
+            item.set_sensitive(False)
+            item.connect("activate", self._copy_recent, i)
+            self.copy_items.append(item)
+            menu.append(item)
 
         menu.append(Gtk.SeparatorMenuItem())
-
-        copy_item = Gtk.MenuItem(label="Copy last transcript")
-        copy_item.connect("activate", self._copy_last)
-        menu.append(copy_item)
 
         self.stop_item = Gtk.MenuItem(label="Stop recording")
         self.stop_item.connect("activate", self._stop_recording)
@@ -145,6 +203,7 @@ class MyWhisprIndicator:
             self.indicator.set_icon("microphone-disabled-symbolic")
             self.indicator.set_label("MyWhispr offline", "MyWhispr offline")
             self.status_item.set_label("MyWhispr: offline")
+            self._update_copy_rows([])
             self.stop_item.set_sensitive(False)
             return True
 
@@ -152,8 +211,17 @@ class MyWhisprIndicator:
         self.indicator.set_icon(icon)
         self.indicator.set_label(label, label)
         self.status_item.set_label(f"MyWhispr: {status.get('state', 'unknown').lower()}")
-        self.last_text = status.get("last_transcript") or ""
-        self.last_item.set_label(self.last_text or "No transcript yet")
+        recent = status.get("recent_transcripts") or []
+        texts = [
+            str(item.get("text") or "")
+            for item in recent
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        if not texts and (status.get("last_transcript") or "").strip():
+            texts = [status.get("last_transcript") or ""]
+        self.recent_texts = texts[:2]
+        self.last_text = self.recent_texts[0] if self.recent_texts else ""
+        self._update_copy_rows(self.recent_texts)
         self.stop_item.set_sensitive(status.get("state") in {"RECORDING", "STARTING"})
 
         if tone == "recording":
@@ -162,12 +230,35 @@ class MyWhisprIndicator:
             self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         return True
 
-    def _copy_last(self, _item: Gtk.MenuItem) -> None:
-        if not self.last_text:
+    def _update_copy_rows(self, texts: list[str]) -> None:
+        for i, item in enumerate(self.copy_items):
+            text = texts[i] if i < len(texts) else ""
+            item.set_sensitive(bool(text))
+            item.set_label(
+                f"Copy: {menu_snippet(text)}"
+                if text
+                else ("No transcript yet" if i == 0 else "No previous transcript")
+            )
+
+    def _copy_recent(self, _item: Gtk.MenuItem, index: int) -> None:
+        if index >= len(self.recent_texts):
             return
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)  # type: ignore[name-defined]
-        clipboard.set_text(self.last_text, -1)
-        clipboard.store()
+        text = self.recent_texts[index]
+        if not text:
+            return
+        copied: list[str] = []
+
+        copied.extend(copy_with_gtk(text))
+
+        try:
+            copied.extend(copy_with_xclip(text))
+        except Exception as e:
+            log(f"xclip failed index={index}: {e}")
+
+        if copied:
+            log(f"copied transcript index={index} chars={len(text)} targets={','.join(copied)}")
+        else:
+            log(f"copy failed index={index}: no clipboard target accepted text")
 
     def _stop_recording(self, _item: Gtk.MenuItem) -> None:
         try:
@@ -180,7 +271,5 @@ class MyWhisprIndicator:
 
 
 if __name__ == "__main__":
-    from gi.repository import Gdk
-
     MyWhisprIndicator()
     Gtk.main()

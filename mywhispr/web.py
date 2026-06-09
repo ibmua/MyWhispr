@@ -206,14 +206,15 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
     async def api_transcription_share(_request):
         cfg = daemon.config.snapshot()
         api_cfg = cfg.get("transcription_api") or {}
+        enabled = bool(api_cfg.get("enabled", False))
+        client_model = transcription_api_client_spec(cfg, include_key=True) if enabled else None
+        client_name = str(api_cfg.get("model_name") or "remote-large-q5")
         return web.json_response({
-            "enabled": bool(api_cfg.get("enabled", False)),
+            "enabled": enabled,
             "running": daemon.transcription_api_runner is not None,
-            "client_model_name": str(api_cfg.get("model_name") or "remote-large-q5"),
-            "client_model": transcription_api_client_spec(cfg, include_key=True),
-            "client_model_json": {
-                str(api_cfg.get("model_name") or "remote-large-q5"): transcription_api_client_spec(cfg, include_key=True)
-            },
+            "client_model_name": client_name,
+            "client_model": client_model,
+            "client_model_json": {client_name: client_model} if client_model else {},
         })
 
     async def api_model_external_save(request):

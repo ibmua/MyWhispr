@@ -10,6 +10,8 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const STATUS_URL = 'http://127.0.0.1:16666/api/status';
 const POLL_MS = 600;
+const COPY_BUTTON_LABELS = ['Copy latest dictation', 'Copy previous dictation'];
+const COPY_SNIPPET_CHARS = 32;
 
 function modeMarker(status) {
     if ((status.current_mode_type || '') === 'script')
@@ -22,6 +24,20 @@ function modeMarker(status) {
     if (lang)
         return `[${lang}]`;
     return '';
+}
+
+function menuSnippet(text) {
+    const flat = (text || '').replace(/\s+/g, ' ').trim();
+    if (flat.length <= 72)
+        return flat;
+    return `${flat.slice(0, 71)}…`;
+}
+
+function buttonSnippet(text) {
+    const flat = (text || '').replace(/\s+/g, ' ').trim();
+    if (flat.length <= COPY_SNIPPET_CHARS)
+        return flat;
+    return `${flat.slice(0, COPY_SNIPPET_CHARS - 1)}…`;
 }
 
 const Indicator = GObject.registerClass(
@@ -41,14 +57,21 @@ class Indicator extends PanelMenu.Button {
         });
         const box = new St.BoxLayout({vertical: false});
         box.add_child(this._icon);
+        this._copyButtons = [];
+        for (let i = 0; i < 2; i++) {
+            const button = this._makeCopyButton(i);
+            this._copyButtons.push(button);
+            box.add_child(button);
+        }
         box.add_child(this._label);
         this.add_child(box);
 
-        // Popup menu items
-        this._textItem = new PopupMenu.PopupMenuItem('—');
-        this._textItem.label.style_class = 'mywhispr-popup-text';
-        this._textItem.connect('activate', () => this._copyLast());
-        this.menu.addMenuItem(this._textItem);
+        this._copyRows = [];
+        for (let i = 0; i < 2; i++) {
+            const row = this._makeCopyMenuRow(i);
+            this._copyRows.push(row);
+            this.menu.addMenuItem(row.item);
+        }
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._stopItem = new PopupMenu.PopupMenuItem('Stop recording');
         this._stopItem.connect('activate', () => this._stopRecording());
@@ -57,7 +80,7 @@ class Indicator extends PanelMenu.Button {
         this._openItem.connect('activate', () => this._openUI());
         this.menu.addMenuItem(this._openItem);
 
-        this._lastText = '';
+        this._recentTranscripts = [];
         this._timerId = 0;
         this._tick();
     }
@@ -88,15 +111,17 @@ class Indicator extends PanelMenu.Button {
     _apply(status) {
         this._icon.opacity = 255;
         const topbar = status.topbar || {};
+        const state = status.state || 'IDLE';
+        const isRec = state === 'RECORDING' || state === 'STARTING';
+        const isBusy = state === 'TRANSCRIBING' || state === 'TRANSCRIBING_NO_PASTE'
+                       || state === 'STOPPING' || state === 'STOPPING_NO_PASTE' || state === 'PASTING';
+        this._updateCopyItems(status);
+        this._setItemSensitive(this._stopItem, isRec);
         if (topbar.enabled === false) {
             this._label.text = '';
             this._icon.opacity = 100;
             return;
         }
-        const state = status.state || 'IDLE';
-        const isRec = state === 'RECORDING' || state === 'STARTING';
-        const isBusy = state === 'TRANSCRIBING' || state === 'TRANSCRIBING_NO_PASTE'
-                       || state === 'STOPPING' || state === 'STOPPING_NO_PASTE' || state === 'PASTING';
         this._label.style_class = 'mywhispr-label' + (isRec ? ' mywhispr-recording' :
                                                      isBusy ? ' mywhispr-busy' : '');
         let text = '';
@@ -106,20 +131,12 @@ class Indicator extends PanelMenu.Button {
         } else if (status.retranslate && status.retranslate.active) {
             text = `retr ${status.retranslate.done}/${status.retranslate.total}`;
         } else if (topbar.show_when_idle !== false) {
-            text = status.last_transcript || '';
+            text = '';
         }
         const maxWords = Number(topbar.max_words || 10);
         const words = (text || '').trim().split(/\s+/).filter(Boolean);
         const shown = words.length > maxWords ? '…' + words.slice(-maxWords).join(' ') : words.join(' ');
         this._label.text = shown;
-        this._lastText = status.last_transcript || '';
-        this._textItem.label.text = this._lastText || '(no transcript yet)';
-        if (typeof this._stopItem.setSensitive === 'function')
-            this._stopItem.setSensitive(isRec);
-        else if (this._stopItem.actor)
-            this._stopItem.actor.reactive = isRec;
-        else
-            this._stopItem.reactive = isRec;
     }
 
     _dim() {
@@ -128,10 +145,126 @@ class Indicator extends PanelMenu.Button {
         this._label.style_class = 'mywhispr-label mywhispr-error';
     }
 
-    _copyLast() {
-        if (!this._lastText) return;
+    _updateCopyItems(status) {
+        const recent = Array.isArray(status.recent_transcripts) ? status.recent_transcripts : [];
+        const texts = recent
+            .map((item) => `${item && item.text ? item.text : ''}`)
+            .filter((text) => text.trim());
+        if (!texts.length && status.last_transcript)
+            texts.push(status.last_transcript);
+        this._recentTranscripts = texts.slice(0, 2);
+
+        for (let i = 0; i < this._copyRows.length; i++) {
+            const text = this._recentTranscripts[i] || '';
+            const row = this._copyRows[i];
+            row.label.text = text
+                ? menuSnippet(text)
+                : (i === 0 ? 'No transcript yet' : 'No previous transcript');
+            row.button.reactive = Boolean(text);
+            row.button.can_focus = Boolean(text);
+            row.button.opacity = text ? 255 : 80;
+            this._setCopyButtonSensitive(this._copyButtons[i], Boolean(text), text);
+        }
+    }
+
+    _makeCopyMenuRow(index) {
+        const item = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false,
+            style_class: 'mywhispr-copy-row-item',
+        });
+        const box = new St.BoxLayout({
+            vertical: false,
+            style_class: 'mywhispr-copy-row',
+        });
+        const buttonContent = new St.BoxLayout({
+            vertical: false,
+            style_class: 'mywhispr-copy-row-button-content',
+        });
+        buttonContent.add_child(new St.Icon({
+            icon_name: 'edit-copy-symbolic',
+            style_class: 'system-status-icon mywhispr-copy-row-icon',
+        }));
+        buttonContent.add_child(new St.Label({
+            y_align: Clutter.ActorAlign.CENTER,
+            text: 'Copy',
+            style_class: 'mywhispr-copy-row-button-label',
+        }));
+        const button = new St.Button({
+            child: buttonContent,
+            reactive: false,
+            can_focus: false,
+            track_hover: true,
+            accessible_name: COPY_BUTTON_LABELS[index],
+            style_class: 'mywhispr-copy-row-button',
+        });
+        button.connect('clicked', () => this._copyRecent(index));
+        const label = new St.Label({
+            y_align: Clutter.ActorAlign.CENTER,
+            text: index === 0 ? 'No transcript yet' : 'No previous transcript',
+            style_class: 'mywhispr-copy-row-text',
+        });
+        box.add_child(button);
+        box.add_child(label);
+        item.add_child(box);
+        return {item, button, label};
+    }
+
+    _makeCopyButton(index) {
+        const content = new St.BoxLayout({
+            vertical: false,
+            style_class: 'mywhispr-copy-button-content',
+        });
+        content.add_child(new St.Icon({
+            icon_name: 'edit-copy-symbolic',
+            style_class: 'system-status-icon mywhispr-copy-icon',
+        }));
+        const label = new St.Label({
+            y_align: Clutter.ActorAlign.CENTER,
+            text: 'Copy',
+            style_class: 'mywhispr-copy-text',
+        });
+        content.add_child(label);
+
+        const button = new St.Button({
+            child: content,
+            reactive: false,
+            can_focus: false,
+            track_hover: true,
+            accessible_name: COPY_BUTTON_LABELS[index],
+            style_class: 'mywhispr-copy-button',
+        });
+        button.connect('clicked', () => this._copyRecent(index));
+        button._mywhisprLabel = label;
+        return button;
+    }
+
+    _setItemSensitive(item, sensitive) {
+        if (typeof item.setSensitive === 'function')
+            item.setSensitive(sensitive);
+        else if (item.actor)
+            item.actor.reactive = sensitive;
+        else
+            item.reactive = sensitive;
+    }
+
+    _setCopyButtonSensitive(button, sensitive, text) {
+        if (!button) return;
+        button.reactive = sensitive;
+        button.can_focus = sensitive;
+        button.opacity = sensitive ? 255 : 75;
+        if (button._mywhisprLabel) {
+            button._mywhisprLabel.text = sensitive
+                ? `Copy: ${buttonSnippet(text)}`
+                : 'Copy';
+        }
+    }
+
+    _copyRecent(index) {
+        const text = this._recentTranscripts[index] || '';
+        if (!text) return;
         const clip = St.Clipboard.get_default();
-        clip.set_text(St.ClipboardType.CLIPBOARD, this._lastText);
+        clip.set_text(St.ClipboardType.CLIPBOARD, text);
     }
 
     _stopRecording() {

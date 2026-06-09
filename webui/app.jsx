@@ -216,14 +216,17 @@ function App() {
     }
   }, [flashNotice]);
 
-  const commitCombo = useCallback(async (keys) => {
+  const commitCombo = useCallback(async (keys, options) => {
+    const opts = options || {};
     try {
       const r = await API.postJSON("/api/shortcuts/" + encodeURIComponent(DEFAULT_TRIGGER) + "/combo", { keys });
       if (!r.ok) throw new Error(r.reason || "failed");
       await reloadConfig();
-      flashNotice("Shortcut updated");
+      if (!opts.silent) flashNotice(opts.label || "Shortcut updated");
+      return true;
     } catch (e) {
-      flashNotice("Shortcut failed: " + e.message, "error");
+      flashNotice((opts.errorPrefix || "Shortcut failed") + ": " + e.message, "error");
+      return false;
     }
   }, [reloadConfig, flashNotice]);
 
