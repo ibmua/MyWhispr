@@ -1,5 +1,5 @@
 {
-  "default_model": "remote-large-q5",
+  "default_model": "parakeet-tdt-0.6b-v3",
   "preload_default_model_on_startup": true,
   "gpu_asr_python": "./.venv-gpu-asr/bin/python",
   "models": {
@@ -58,13 +58,13 @@
       "description": "Lightweight",
       "subdescription": "Fallback"
     },
-    "qwen3-asr-1.7b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-1.7B", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
+    "qwen3-asr-1.7b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-1.7B", "python": "./.venv-qwen-asr/bin/python", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
     "granite-speech-4.1-2b": {"backend": "transformers_speech_seq2seq", "repo_id": "ibm-granite/granite-speech-4.1-2b", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
     "cohere-transcribe-03-2026": {"backend": "cohere_asr", "repo_id": "CohereLabs/cohere-transcribe-03-2026", "device": "cuda:0", "dtype": "auto", "local_files_only": true, "trust_remote_code": false, "live_preview": true},
     "canary-qwen-2.5b": {"backend": "nemo_salm", "repo_id": "nvidia/canary-qwen-2.5b", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true},
     "canary-1b-v2": {"backend": "nemo_asr", "repo_id": "nvidia/canary-1b-v2", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true, "nemo_language_kwargs": true},
     "seamless-m4t-v2-large": {"backend": "seamless_m4t_v2", "repo_id": "facebook/seamless-m4t-v2-large", "device": "cuda:0", "dtype": "float16", "local_files_only": true, "live_preview": true},
-    "qwen3-asr-0.6b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-0.6B", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true}
+    "qwen3-asr-0.6b": {"backend": "qwen_asr", "repo_id": "Qwen/Qwen3-ASR-0.6B", "python": "./.venv-qwen-asr/bin/python", "device": "cuda:0", "dtype": "bfloat16", "local_files_only": true, "live_preview": true}
   },
   "whisper_server_binary": "/path/to/whisper-server-linux-x64-cuda",
   "whisper_host": "127.0.0.1",
@@ -78,7 +78,7 @@
     "api_key": "",
     "advertised_host": "",
     "advertised_scheme": "http",
-    "model_name": "remote-large-q5"
+    "model_name": "parakeet-tdt-0.6b-v3"
   },
   "history_limit": 20,
   "stop_timeout_seconds": 3.0,
@@ -88,14 +88,15 @@
   "type_key_delay_ms": 0,
   "direct_type_max_chars": 240,
   "direct_type_ascii_only": true,
+  "prefer_clipboard_paste": true,
   "audio_cues": {"enabled": true, "volume": 0.85, "start_recording_delay_seconds": 0.08},
   "streaming": {
     "app_output_enabled": true,
-    "interval_seconds": 0.8,
-    "initial_delay_seconds": 1.2,
-    "stable_lag_seconds": 0.65,
+    "interval_seconds": 0.45,
+    "initial_delay_seconds": 0.35,
+    "stable_lag_seconds": 0.35,
     "max_rewrite_chars": 180,
-    "initial_commit_confirmations": 2,
+    "initial_commit_confirmations": 1,
     "rewrite_backspace_confirmations": 2
   },
   "triggers": {

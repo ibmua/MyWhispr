@@ -117,6 +117,12 @@ class ModelServer:
         self.gpu.models = model_specs
         self.external.set_models(model_specs)
 
+    def set_gpu_python(self, python: str) -> None:
+        self.gpu.set_default_python(python)
+
+    def set_whisper_binary(self, binary: str) -> None:
+        self.whisper.binary = binary
+
     def set_idle_shutdown_seconds(self, seconds: float) -> None:
         self.whisper.idle_shutdown_seconds = seconds
         self.gpu.idle_shutdown_seconds = seconds

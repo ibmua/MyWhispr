@@ -6,7 +6,9 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +27,34 @@ from .streaming import StreamingSession
 from .tones import Tones
 from .transcriber import Transcriber
 from .web import start_transcription_api_server, start_web_server
+from .model_download import ModelDownloadManager
 from .model_server import ModelServer
+from .model_specs import normalize_model_spec, resolve_project_python
 
 log = logging.getLogger(__name__)
 
 GRAVE_KEYCODE = 41
 TRIGGER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+MAX_QUEUED_RECORDINGS = 16
+
+
+@dataclass
+class TranscriptionJob:
+    """A finished recording captured for background processing.
+
+    Everything needed to transcribe and insert the text is snapshotted here so
+    the daemon can start the next recording while this one is still in flight.
+    """
+
+    wav_bytes: bytes
+    duration: float
+    language: str
+    mode: str
+    mode_cfg: dict[str, Any] = field(default_factory=dict)
+    trigger: str = "grave"
+    paste_allowed: bool = True
+    lowercase_initial: bool = False
+    stream: StreamingSession | None = None
 
 
 class Daemon:
@@ -86,6 +110,26 @@ class Daemon:
                 name="alt",
             )
 
+        def _download_python(spec: dict[str, Any]) -> str:
+            root = webui_dir.parent
+            for cand in (
+                spec.get("python"),
+                spec.get("gpu_asr_python"),
+                config.get("gpu_asr_python"),
+            ):
+                if not cand:
+                    continue
+                exe = resolve_project_python(str(cand), root)
+                if exe.is_file():
+                    return str(exe)
+            return sys.executable
+
+        self.model_downloads = ModelDownloadManager(
+            root=webui_dir.parent,
+            python_resolver=_download_python,
+            on_complete=self._after_model_download,
+        )
+
         self.retranslator = Retranslator(
             config=config,
             history=self.history,
@@ -95,6 +139,8 @@ class Daemon:
         )
 
         self.control_server: ControlSocketServer | None = None
+        self.tray = None
+        self.request_shutdown = None  # set by __main__; used by the tray Quit item
         self.web_runner = None
         self.transcription_api_runner = None
         self._transcription_api_lock = asyncio.Lock()
@@ -127,6 +173,13 @@ class Daemon:
         self._last_key_up_at: dict[int, float] = {}
         self._combo_key_down_at: dict[int, float] = {}
 
+        # Finished recordings wait here; one worker drains them in order so
+        # a new recording can start while the previous one is still being
+        # transcribed and inserted.
+        self._job_queue: asyncio.Queue[TranscriptionJob] = asyncio.Queue(maxsize=MAX_QUEUED_RECORDINGS)
+        self._job_phase: str = ""  # "" | "transcribing" | "pasting"
+        self._job_worker_task: asyncio.Task | None = None
+
         self._fsm_check()
 
     # ------------------------------------------------------------------ FSM
@@ -148,6 +201,30 @@ class Daemon:
         while True:
             event, payload, seq = await self.event_queue.get()
             await self._dispatch(event, payload, seq)
+
+    async def _drain_jobs(self) -> None:
+        while True:
+            job = await self._job_queue.get()
+            self._job_phase = "transcribing"
+            try:
+                await _process_job(self, job)
+            except Exception:
+                log.exception("transcription job crashed")
+            finally:
+                self._job_phase = ""
+                self._job_queue.task_done()
+
+    def jobs_busy(self) -> bool:
+        return bool(self._job_phase) or not self._job_queue.empty()
+
+    def jobs_pending(self) -> int:
+        return self._job_queue.qsize() + (1 if self._job_phase else 0)
+
+    def display_state(self) -> str:
+        """FSM state for the UI, overlaying background job phases while idle."""
+        if self.state == State.IDLE and self._job_phase:
+            return State.PASTING.value if self._job_phase == "pasting" else State.TRANSCRIBING.value
+        return self.state.value
 
     async def _dispatch(self, event: Event, payload: dict, seq: int) -> None:
         handler = TRANSITIONS.get((self.state, event))
@@ -186,6 +263,7 @@ class Daemon:
             self._on_key,
             include_patterns=grab_cfg.get("device_name_patterns") or [],
             exclude_patterns=grab_cfg.get("exclude_device_name_patterns") or [],
+            trigger_codes_provider=self._all_trigger_codes,
         )
         await self.input_supervisor.start()
 
@@ -195,16 +273,52 @@ class Daemon:
         )
         await self._sync_transcription_api_server()
 
+        if sys.platform == "win32":
+            try:
+                from .tray_windows import TrayIcon
+
+                url = f"http://{webcfg.get('host', '127.0.0.1')}:{int(webcfg.get('port', 16666))}/"
+                self.tray = TrayIcon(
+                    url=url,
+                    state_provider=lambda: self.display_state(),
+                    model_provider=lambda: self.primary_server.loaded_model
+                    or self.config.get("default_model")
+                    or "",
+                    on_quit=lambda: self.request_shutdown and self.request_shutdown(),
+                )
+                if not self.tray.start():
+                    log.warning("tray icon was created but did not become active")
+            except Exception:
+                log.exception("tray icon failed to start")
+
         self.config.subscribe(self._config_changed)
 
         # Drain events as a background task.
         asyncio.create_task(self._drain_events())
+        self._job_worker_task = asyncio.create_task(self._drain_jobs())
         if bool(self.config.get("preload_default_model_on_startup", True)):
             self._schedule_warm(self.config.get("default_model"), reason="startup")
 
     async def shutdown(self) -> None:
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                log.exception("tray icon stop failed")
         if self._stream is not None:
             await self._stream.stop()
+        if self._job_worker_task is not None and not self._job_worker_task.done():
+            if self._job_phase or not self._job_queue.empty():
+                # Let in-flight dictation finish landing before exit (bounded).
+                try:
+                    await asyncio.wait_for(self._job_queue.join(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    log.warning("shutdown: pending transcription jobs abandoned")
+            self._job_worker_task.cancel()
+            try:
+                await self._job_worker_task
+            except asyncio.CancelledError:
+                pass
         if self._warm_task is not None and not self._warm_task.done():
             self._warm_task.cancel()
             try:
@@ -228,6 +342,8 @@ class Daemon:
         self.history.set_limit(int(snapshot.get("history_limit", 20)))
         models = snapshot.get("models") or {}
         self.primary_server.set_models(models)
+        self.primary_server.set_gpu_python(str(snapshot.get("gpu_asr_python") or ""))
+        self.primary_server.set_whisper_binary(str(snapshot.get("whisper_server_binary") or ""))
         audio_cues = snapshot.get("audio_cues") or {}
         self.tones.configure(
             enabled=bool(audio_cues.get("enabled", True)),
@@ -441,8 +557,25 @@ class Daemon:
                 await self._warm_task
             except asyncio.CancelledError:
                 pass
-        self.config.set("default_model", model)
-        return await self.primary_server.ensure_ready(model)
+        ok = await self.primary_server.ensure_ready(model)
+        if ok:
+            self.config.set("default_model", model)
+        return ok
+
+    async def start_model_download(self, model: str) -> tuple[bool, str]:
+        models = self.config.get("models") or {}
+        if model not in models:
+            return False, f"unknown model {model!r}"
+        spec = normalize_model_spec(model, models[model])
+        return await self.model_downloads.start(model, spec)
+
+    async def _after_model_download(self, model: str) -> None:
+        log.info("model download complete; applying model=%s", model)
+        ok = await self.warm_model(model)
+        if not ok:
+            self._error_message = (
+                f"downloaded {model} but loading failed: {self.primary_server.last_error}"
+            )
 
     async def unload_model(self) -> None:
         if self._warm_task is not None and not self._warm_task.done():
@@ -712,7 +845,10 @@ class Daemon:
             if item.text.strip()
         ][:2]
         return {
-            "state": self.state.value,
+            "state": self.display_state(),
+            "fsm_state": self.state.value,
+            "queue_pending": self.jobs_pending(),
+            "queue_phase": self._job_phase,
             "pid": self.pid,
             "uptime_seconds": int(time.time() - self.started_at),
             "current_trigger": self._current_trigger,
@@ -742,6 +878,16 @@ class Daemon:
         }
 
     # ----------------------------------------------------- internal helpers
+
+    def _all_trigger_codes(self) -> set[int]:
+        codes: set[int] = set()
+        for trig_cfg in (self.config.get("triggers") or {}).values():
+            for c in trig_cfg.get("stop_on_release_codes") or [GRAVE_KEYCODE]:
+                try:
+                    codes.add(int(c))
+                except (TypeError, ValueError):
+                    continue
+        return codes
 
     def _trigger_stop_codes(self, trigger: str) -> set[int]:
         triggers = self.config.get("triggers") or {}
@@ -1032,7 +1178,9 @@ async def _start_recording_effect(d: Daemon, trigger: str) -> None:
             wav_provider=wav_provider,
             on_preview=on_preview,
             loop=asyncio.get_event_loop(),
-            app_output_allowed_provider=lambda: _mode_allows_app_output(d),
+            # Hold app output while earlier recordings are still being
+            # inserted so queued takes never interleave in the focused app.
+            app_output_allowed_provider=lambda: _mode_allows_app_output(d) and not d.jobs_busy(),
             text_transform_provider=lambda text: _apply_session_text_transform(d, text),
         )
         d._stream.start()
@@ -1114,6 +1262,14 @@ def _apply_session_text_transform(d: Daemon, text: str) -> str:
     return text
 
 
+def _apply_job_text_transform(job: TranscriptionJob, text: str) -> str:
+    # The session flag is captured into the job because processing happens in
+    # the background, possibly while a new session is already recording.
+    if job.lowercase_initial:
+        return text_cleanup.lowercase_first_cased(text)
+    return text
+
+
 async def _handle_lowercase_initial(d: Daemon) -> State:
     if d._session_lowercase_initial:
         return d.state
@@ -1172,97 +1328,49 @@ async def _handle_recorder_ready_while_stopping(d: Daemon) -> State:
     return State.STOPPING
 
 
+def _capture_job(d: Daemon, *, paste_allowed: bool) -> TranscriptionJob:
+    """Snapshot the finished recording so the daemon can go IDLE immediately."""
+    wav_bytes = b""
+    rec_path = d.recorder.path
+    if rec_path is not None and rec_path.exists():
+        wav_bytes = d.recorder.read_bytes()
+    duration = d.recorder.duration_seconds()
+    d.recorder.cleanup()
+    job = TranscriptionJob(
+        wav_bytes=wav_bytes,
+        duration=duration,
+        language=d._current_language,
+        mode=d._current_mode,
+        mode_cfg=dict(d._current_mode_config or {}),
+        trigger=d._current_trigger or "grave",
+        paste_allowed=paste_allowed,
+        lowercase_initial=d._session_lowercase_initial,
+        stream=d._stream,
+    )
+    d._stream = None
+    d._last_preview_text = ""
+    d.last_stop_at = time.monotonic()
+    _clear_current_recording(d)
+    return job
+
+
+def _enqueue_job(d: Daemon, job: TranscriptionJob) -> None:
+    try:
+        d._job_queue.put_nowait(job)
+    except asyncio.QueueFull:
+        log.error("transcription queue full (%d); dropping recording", MAX_QUEUED_RECORDINGS)
+        d.tones.play_error()
+
+
 async def _handle_recorder_stopped(d: Daemon) -> State:
     d._cancel_stop_watchdog()
-    asyncio.create_task(_transcribe_and_paste(d, paste_allowed=True))
-    return State.TRANSCRIBING
+    _enqueue_job(d, _capture_job(d, paste_allowed=True))
+    return State.IDLE
 
 
 async def _handle_recorder_stopped_nopaste(d: Daemon) -> State:
     d._cancel_stop_watchdog()
-    asyncio.create_task(_transcribe_and_paste(d, paste_allowed=False))
-    return State.TRANSCRIBING_NO_PASTE
-
-
-async def _handle_transcript_ready(
-    d: Daemon,
-    *,
-    paste_allowed: bool,
-    text: str,
-    raw: str,
-    model: str,
-    language: str,
-    duration: float,
-    audio: bytes,
-    generation_ms: int = 0,
-    mode: str = "",
-    script: dict[str, Any] | None = None,
-) -> State:
-    item = HistoryItem(
-        mode=mode or d._current_mode,
-        language=language,
-        trigger=d._current_trigger or "grave",
-        duration_seconds=duration,
-        generation_ms=generation_ms,
-        text=text,
-        raw_text=raw,
-        model=model,
-        audio_bytes=audio,
-        script=script or {},
-    )
-    if not paste_allowed:
-        item.pasted = False
-        if script:
-            item.failed_reason = "" if script.get("ok") else "script_failed"
-        else:
-            item.failed_reason = "no_paste"
-        d.history.add(item)
-        if script and not script.get("ok"):
-            d.tones.play_error()
-        d.last_stop_at = time.monotonic()
-        _clear_current_recording(d)
-        return State.IDLE
-    if not text:
-        d.history.add(item)
-        d.last_stop_at = time.monotonic()
-        _clear_current_recording(d)
-        return State.IDLE
-    d.history.add(item)
-    asyncio.create_task(_paste_and_finalize(d, item, text))
-    return State.PASTING
-
-
-async def _handle_transcript_failed(d: Daemon, *, reason: str, audio: bytes, language: str, duration: float) -> State:
-    item = HistoryItem(
-        mode=d._current_mode,
-        language=language,
-        trigger=d._current_trigger or "grave",
-        duration_seconds=duration,
-        text="",
-        raw_text="",
-        model=d.primary_server.loaded_model or "",
-        audio_bytes=audio,
-        failed_reason=reason,
-    )
-    d.history.add(item)
-    d.tones.play_error()
-    d.last_stop_at = time.monotonic()
-    _clear_current_recording(d)
-    return State.IDLE
-
-
-async def _handle_no_text(d: Daemon) -> State:
-    d.last_stop_at = time.monotonic()
-    _clear_current_recording(d)
-    return State.IDLE
-
-
-async def _handle_paste_done(d: Daemon, *, item_id: str, ok: bool) -> State:
-    d.history.update(item_id, pasted=ok, failed_reason=("" if ok else "paste_failed"))
-    if not ok:
-        d.tones.play_error()
-    d.last_stop_at = time.monotonic()
-    _clear_current_recording(d)
+    _enqueue_job(d, _capture_job(d, paste_allowed=False))
     return State.IDLE
 
 
@@ -1347,91 +1455,102 @@ async def _run_script_mode(
     return result
 
 
-async def _transcribe_and_paste(d: Daemon, *, paste_allowed: bool) -> None:
-    wav_bytes = b""
-    rec_path = d.recorder.path
-    if rec_path is not None and rec_path.exists():
-        wav_bytes = d.recorder.read_bytes()
-    duration = d.recorder.duration_seconds()
-    language = d._current_language
-    mode = d._current_mode
-    mode_cfg = dict(d._current_mode_config or {})
+async def _process_job(d: Daemon, job: TranscriptionJob) -> None:
+    """Transcribe one finished recording, run scripts, insert text, record history."""
+    wav_bytes = job.wav_bytes
     min_dur = float(d.config.get("minimum_recording_seconds", 0.25))
     if not wav_bytes or len(wav_bytes) < 44 + int(16000 * 2 * min_dur):
-        d.recorder.cleanup()
-        d.post(Event.NO_TEXT)
         return
     try:
         res = await d.transcriber.transcribe(
             d.primary_server,
             wav_bytes,
-            language=language,
+            language=job.language,
         )
     except Exception as e:
         log.exception("transcription failed")
-        reason = str(e) or type(e).__name__
-        d.recorder.cleanup()
-        d.post(
-            Event.TRANSCRIPT_FAILED,
-            reason=reason,
-            audio=wav_bytes,
-            language=language,
-            duration=duration,
-        )
+        d.history.add(HistoryItem(
+            mode=job.mode,
+            language=job.language,
+            trigger=job.trigger,
+            duration_seconds=job.duration,
+            text="",
+            raw_text="",
+            model=d.primary_server.loaded_model or "",
+            audio_bytes=wav_bytes,
+            failed_reason=str(e) or type(e).__name__,
+        ))
+        d.tones.play_error()
         return
-    d.recorder.cleanup()
     generation_ms = max(0, int(round(res.elapsed_seconds * 1000)))
     script_result = None
-    text = _apply_session_text_transform(d, res.text)
-    if (mode_cfg.get("type") == "script") and res.text:
+    text = _apply_job_text_transform(job, res.text)
+    paste_allowed = job.paste_allowed
+    if (job.mode_cfg.get("type") == "script") and res.text:
         paste_allowed = False
         script_result = await _run_script_mode(
             d,
-            mode=mode,
-            mode_cfg=mode_cfg,
+            mode=job.mode,
+            mode_cfg=job.mode_cfg,
             text=text,
             raw=res.raw_text,
-            language=language,
+            language=job.language,
             model=res.model,
-            duration=duration,
+            duration=job.duration,
             generation_ms=generation_ms,
         )
-    d.post(
-        Event.TRANSCRIPT_READY,
-        paste_allowed=paste_allowed,
-        text=text,
-        raw=res.raw_text,
-        model=res.model,
-        language=language,
-        duration=duration,
+    item = HistoryItem(
+        mode=job.mode,
+        language=job.language,
+        trigger=job.trigger,
+        duration_seconds=job.duration,
         generation_ms=generation_ms,
-        audio=wav_bytes,
-        mode=mode,
-        script=script_result,
+        text=text,
+        raw_text=res.raw_text,
+        model=res.model,
+        audio_bytes=wav_bytes,
+        script=script_result or {},
     )
+    if not paste_allowed:
+        item.pasted = False
+        if script_result:
+            item.failed_reason = "" if script_result.get("ok") else "script_failed"
+        else:
+            item.failed_reason = "no_paste"
+        d.history.add(item)
+        if script_result and not script_result.get("ok"):
+            d.tones.play_error()
+        return
+    if not text:
+        d.history.add(item)
+        return
+    d.history.add(item)
+    d._job_phase = "pasting"
+    ok = await _paste_job(d, job, text)
+    d.history.update(item.id, pasted=ok, failed_reason=("" if ok else "paste_failed"))
+    if not ok:
+        d.tones.play_error()
 
 
-async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
-    # If streaming committed text into the focused app, reconcile.
-    streaming_committed = ""
-    if d._stream is not None:
-        streaming_committed = d._stream.committed_text
+async def _paste_job(d: Daemon, job: TranscriptionJob, text: str) -> bool:
+    # If this job's streaming session committed text into the focused app,
+    # reconcile against it; otherwise paste the final text.
+    streaming_committed = job.stream.committed_text if job.stream is not None else ""
     type_kwargs = {
         "type_key_delay_ms": int(d.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
         "direct_type_max_chars": int(d.config.get("direct_type_max_chars", 240)),
         "direct_type_ascii_only": bool(d.config.get("direct_type_ascii_only", True)),
+        "prefer_clipboard_paste": bool(d.config.get("prefer_clipboard_paste", paste_mod.DEFAULT_PREFER_CLIPBOARD_PASTE)),
     }
     if streaming_committed:
         max_rewrite = int((d.config.get("streaming") or {}).get("max_rewrite_chars", 180))
-        diverge = d._stream.divergence_from_final(text) if d._stream else 0
+        diverge = job.stream.divergence_from_final(text) if job.stream else 0
         if diverge > max_rewrite:
             # Refuse destructive rewrite without replacing the user's clipboard.
             log.warning("final divergence %d > %d; refusing rewrite", diverge, max_rewrite)
-            d.tones.play_error()
-            d.post(Event.PASTE_DONE, item_id=item.id, ok=False)
-            return
+            return False
         # Reconcile via stream_replace (backspace divergence + paste remainder).
-        ok = await paste_mod.stream_replace(
+        return await paste_mod.stream_replace(
             previous=streaming_committed,
             new=text,
             settle_seconds=float(d.config.get("clipboard_settle_seconds", 0.03)),
@@ -1440,17 +1559,13 @@ async def _paste_and_finalize(d: Daemon, item, text: str) -> None:
             key_delay_ms=int(d.config.get("paste_key_delay_ms", 18)),
             **type_kwargs,
         )
-        d.post(Event.PASTE_DONE, item_id=item.id, ok=ok)
-        return
-    # Standard path: paste final text.
-    ok = await paste_mod.paste_final(
+    return await paste_mod.paste_final(
         text,
         settle_seconds=float(d.config.get("clipboard_settle_seconds", 0.03)),
         consume_timeout=float(d.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
         key_delay_ms=int(d.config.get("paste_key_delay_ms", 18)),
         **type_kwargs,
     )
-    d.post(Event.PASTE_DONE, item_id=item.id, ok=ok)
 
 
 # ======================================================== dispatch table
@@ -1477,11 +1592,4 @@ TRANSITIONS: dict[tuple[State, Event], Any] = {
     (State.STOPPING, Event.RECORDER_FAILED): _handle_recorder_failed,
     (State.STOPPING, Event.RECORDER_EXITED_ERROR): _handle_recorder_failed,
     (State.STOPPING_NO_PASTE, Event.RECORDER_STOPPED): _handle_recorder_stopped_nopaste,
-    (State.TRANSCRIBING, Event.TRANSCRIPT_READY): _handle_transcript_ready,
-    (State.TRANSCRIBING, Event.TRANSCRIPT_FAILED): _handle_transcript_failed,
-    (State.TRANSCRIBING, Event.NO_TEXT): _handle_no_text,
-    (State.TRANSCRIBING_NO_PASTE, Event.TRANSCRIPT_READY): _handle_transcript_ready,
-    (State.TRANSCRIBING_NO_PASTE, Event.TRANSCRIPT_FAILED): _handle_transcript_failed,
-    (State.TRANSCRIBING_NO_PASTE, Event.NO_TEXT): _handle_no_text,
-    (State.PASTING, Event.PASTE_DONE): _handle_paste_done,
 }

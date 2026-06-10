@@ -5,6 +5,7 @@ import logging
 import math
 import subprocess
 import struct
+import sys
 import wave
 from pathlib import Path
 
@@ -71,6 +72,14 @@ class Tones:
 
     def _play(self, path: Path) -> None:
         if not self.enabled:
+            return
+        if sys.platform == "win32":
+            try:
+                import winsound
+
+                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+            except Exception as e:
+                log.warning("cue play failed (%s): %s", path.name, e)
             return
         try:
             subprocess.Popen(

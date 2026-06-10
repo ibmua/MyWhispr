@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import signal
+import shutil
 import time
 from collections import deque
 from pathlib import Path
@@ -147,11 +148,23 @@ class WhisperServer:
             self.last_error = f"model file missing: {model} -> {model_path}"
             log.error(self.last_error)
             return False
+        binary = str(self.binary or "").strip()
+        if not binary:
+            self.last_error = (
+                "whisper_server_binary is not configured; set it to a whisper.cpp "
+                "server executable before selecting whisper.cpp models"
+            )
+            log.error(self.last_error)
+            return False
+        resolved_binary = shutil.which(binary) or binary
+        if not Path(resolved_binary).is_file():
+            self.last_error = f"whisper_server_binary not found or not executable: {binary}"
+            log.error(self.last_error)
+            return False
         self._ready.clear()
         self.last_error = ""
-        self.loaded_model = model
         args = [
-            self.binary,
+            resolved_binary,
             "-m", model_path,
             "--host", self.host,
             "--port", str(self.port),
@@ -169,6 +182,11 @@ class WhisperServer:
             self.last_error = f"binary missing: {e}"
             log.error(self.last_error)
             return False
+        except OSError as e:
+            self.last_error = f"failed to start whisper_server_binary {binary!r}: {e}"
+            log.error(self.last_error)
+            return False
+        self.loaded_model = model
         self._stderr_tail.clear()
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         return True

@@ -113,6 +113,19 @@ const LANGUAGE_FLAGS = {
 const LANGUAGE_SLOT_CAPACITY = 56;
 const LANGUAGE_OVERFLOW_RESERVED_SLOTS = 2;
 const LANGUAGE_PRIORITY = ["uk", "en"];
+const USE_FLAG_IMAGES = typeof navigator !== "undefined"
+  && /windows/i.test(`${navigator.userAgent || ""} ${navigator.platform || ""}`);
+
+function flagCountryCode(flag) {
+  const chars = Array.from(String(flag || ""));
+  if (chars.length !== 2) return "";
+  const letters = chars.map((ch) => {
+    const cp = ch.codePointAt(0);
+    if (cp < 0x1F1E6 || cp > 0x1F1FF) return "";
+    return String.fromCharCode(97 + cp - 0x1F1E6);
+  });
+  return letters.every(Boolean) ? letters.join("") : "";
+}
 
 function modelIconName(name) {
   const n = String(name || "").toLowerCase();
@@ -153,7 +166,7 @@ function languageBadges(languages) {
       const key = String(code || "").trim();
       if (!key) return null;
       const meta = LANGUAGE_FLAGS[key] || { flag: key.toUpperCase(), label: key };
-      return { code: key, ...meta };
+      return { code: key, text: key.toUpperCase(), country: flagCountryCode(meta.flag), ...meta };
     })
     .filter(Boolean);
   return [
@@ -162,7 +175,7 @@ function languageBadges(languages) {
   ];
 }
 
-function ModelCard({ m, active, onSelect, onDelete, busy }) {
+function ModelCard({ m, active, onSelect, onDelete, onDownload, busy }) {
   const IconComp = Icon[modelIconName(m.name)] || Icon.Bolt;
   const fallbackMeta = modelMeta(m.name);
   const meta = {
@@ -176,27 +189,49 @@ function ModelCard({ m, active, onSelect, onDelete, busy }) {
   const visibleLangs = langs.slice(0, visibleLimit);
   const hiddenLangCount = Math.max(0, langs.length - visibleLangs.length);
   const selectable = m.selectable !== false && m.exists !== false;
+  const dl = m.download || null;
+  const downloading = !!(dl && dl.state === "downloading");
+  const downloadable = !!(m.downloadable || m.download_url || (m.cached === false && m.repo_id));
+  const unavailable = !!m.unavailable_reason && m.selectable === false;
+  const missingDownload = m.exists === false || m.cached === false;
+  const needsDownload = !unavailable && downloadable && missingDownload && !downloading;
+  const interactive = !unavailable && (selectable || needsDownload);
+  const dlPct = downloading && dl.total_bytes > 0
+    ? Math.min(100, Math.round((dl.downloaded_bytes / dl.total_bytes) * 100))
+    : null;
   const className = [
     "model-card",
     active && "active",
     m.running && "running",
-    !selectable && "missing",
-    busy && "busy",
+    needsDownload && "downloadable",
+    !interactive && "missing",
+    (busy || downloading) && "busy",
   ].filter(Boolean).join(" ");
   let badge = "ready";
   if (m.backend === "external_api" && !m.api_key_configured && m.api_key_required !== false) badge = "key missing";
+  else if (downloading) badge = dlPct === null ? "downloading…" : `downloading ${dlPct}%`;
+  else if (unavailable) badge = "server missing";
+  else if (dl && dl.state === "error" && missingDownload) badge = "download failed";
+  else if (needsDownload) badge = "download";
   else if (m.cached === false) badge = "not cached";
   else if (!selectable) badge = "missing";
   else if (m.running) badge = "running";
   else if (active) badge = "active";
   const backend = m.backend && m.backend !== "whisper.cpp" ? m.backend.replace(/_/g, " ") : "";
-  const title = selectable
-    ? `${m.label || m.name}${backend ? ` (${backend})` : ""}${m.install_hint ? `\n${m.install_hint}` : ""}`
-    : "model unavailable";
+  const title = !interactive
+    ? (m.unavailable_reason || "model unavailable")
+    : needsDownload
+      ? `${m.label || m.name} — click to download${m.repo_id ? ` ${m.repo_id}` : ""} and switch to it`
+      : `${m.label || m.name}${backend ? ` (${backend})` : ""}${m.install_hint ? `\n${m.install_hint}` : ""}`;
+  const handleClick = () => {
+    if (busy || downloading || !interactive) return;
+    if (needsDownload && onDownload) onDownload(m.name);
+    else if (selectable) onSelect(m.name);
+  };
   return (
     <div
       className={className}
-      onClick={() => selectable && !busy && onSelect(m.name)}
+      onClick={handleClick}
       title={title}
     >
       <div className="model-top">
@@ -215,7 +250,11 @@ function ModelCard({ m, active, onSelect, onDelete, busy }) {
         <span className="badge">{badge}</span>
       </div>
       <div className="model-size">
-        {m.backend === "whisper.cpp" ? fmt.bytes(m.size_bytes) : (m.backend === "external_api" ? "External API" : "GPU streaming")}
+        {m.backend === "whisper.cpp"
+          ? fmt.bytes(m.size_bytes)
+          : (m.backend === "external_api"
+              ? "External API"
+              : [m.device || "GPU", m.dtype, backend].filter(Boolean).join(" · "))}
       </div>
       <div className="model-desc">
         {meta.desc}{meta.subdesc && <><span className="dot">•</span>{meta.subdesc}</>}
@@ -232,8 +271,25 @@ function ModelCard({ m, active, onSelect, onDelete, busy }) {
           aria-label={`Supported languages: ${langs.map((l) => l.label).join(", ")}`}
         >
           {visibleLangs.map((l) => (
-            <span className="lang-flag" key={l.code} title={`${l.label} (${l.code})`}>
-              {l.flag}
+            <span
+              className={`lang-flag ${USE_FLAG_IMAGES && l.country ? "image" : "emoji"}`}
+              key={l.code}
+              title={`${l.label} (${l.code})`}
+            >
+              {USE_FLAG_IMAGES && l.country ? (
+                <>
+                  <img
+                    src={`/static/flags/4x3/${l.country}.svg`}
+                    alt={l.flag}
+                    onError={(e) => {
+                      e.currentTarget.style.display = "none";
+                      const fallback = e.currentTarget.nextElementSibling;
+                      if (fallback) fallback.style.display = "inline";
+                    }}
+                  />
+                  <span className="lang-code-fallback">{l.text}</span>
+                </>
+              ) : l.flag}
             </span>
           ))}
           {hiddenLangCount > 0 && (
@@ -377,7 +433,7 @@ function ExternalApiModelForm({ onSave, busy }) {
   );
 }
 
-function ModelsCard({ models, activeModel, onSelect, onUnload, onSaveExternal, onDeleteModel, busy }) {
+function ModelsCard({ models, activeModel, onSelect, onDownload, onUnload, onSaveExternal, onDeleteModel, busy }) {
   const items = (models && models.items) || [];
   const anyRunning = items.some((m) => m.running);
   return (
@@ -402,6 +458,7 @@ function ModelsCard({ models, activeModel, onSelect, onUnload, onSaveExternal, o
                 active={activeModel === m.name}
                 onSelect={onSelect}
                 onDelete={onDeleteModel}
+                onDownload={onDownload}
                 busy={busy}
               />
             ))
@@ -422,6 +479,9 @@ function DaemonStatus({ snap }) {
   const topbar = (snap && snap.topbar) || {};
   const devices = (snap && snap.device_names) || [];
   const inflight = primary.inflight || 0;
+  const gpu = (primary.gpu && primary.gpu.device_report) || {};
+  const gpuLoaded = primary.gpu && primary.gpu.running && primary.gpu.loaded_model;
+  const vram = gpu.memory_reserved || gpu.memory_allocated || 0;
   return (
     <section className="card col-5">
       <div className="card-head">
@@ -441,6 +501,18 @@ function DaemonStatus({ snap }) {
         <div className="row"><span className="key">Uptime</span><span className="val tabular">{snap ? fmt.uptime(snap.uptime_seconds) : "—"}</span></div>
         <div className="row"><span className="key">Whisper port</span><span className="val mono">{primary.port || "—"}</span></div>
         <div className="row"><span className="key">History items</span><span className="val tabular">{snap ? (snap.history_count || 0) : 0}</span></div>
+
+        <div className="row"><span className="key">Backend</span>
+          <span className="val mono">{primary.active_backend || "—"}{primary.loaded_model ? ` (${primary.loaded_model})` : ""}</span>
+        </div>
+        <div className="row"><span className="key">GPU</span>
+          <span className={`val ${gpu.cuda_available ? "green" : ""}`}>
+            {gpu.gpu_name ? gpu.gpu_name : (gpuLoaded ? "CPU only" : "—")}
+          </span>
+        </div>
+        <div className="row"><span className="key">VRAM in use</span>
+          <span className="val tabular">{gpuLoaded && vram ? fmt.bytes(vram) : "—"}</span>
+        </div>
 
         <div className="row"><span className="key">Inflight requests</span><span className="val tabular">{inflight}</span></div>
         <div className="row"><span className="key">Server</span>

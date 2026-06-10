@@ -8,6 +8,10 @@ import os
 import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
+
+
+WINDOWS_CONTROL_PORT = 16667
 
 
 def _socket_path() -> Path:
@@ -18,7 +22,43 @@ def _socket_path() -> Path:
     return Path(f"/run/user/{uid}/mywhispr.sock")
 
 
+def _tcp_target() -> tuple[str, int]:
+    env = os.environ.get("MYWHISPR_SOCKET")
+    if env:
+        parsed = urlparse(env)
+        if parsed.scheme == "tcp" and parsed.hostname:
+            return parsed.hostname, int(parsed.port or WINDOWS_CONTROL_PORT)
+    return "127.0.0.1", WINDOWS_CONTROL_PORT
+
+
 def _send(req: dict, timeout: float = 2.0) -> dict:
+    if sys.platform == "win32" or str(os.environ.get("MYWHISPR_SOCKET") or "").startswith("tcp://"):
+        host, port = _tcp_target()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+        except (OSError, ConnectionRefusedError) as e:
+            return {"ok": False, "reason": f"socket_unreachable: {e}"}
+        try:
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            try:
+                return json.loads(line.decode("utf-8"))
+            except Exception as e:
+                return {"ok": False, "reason": f"invalid_response: {e}", "raw": line.decode("utf-8", "replace")}
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
     path = _socket_path()
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)

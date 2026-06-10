@@ -39,7 +39,7 @@ http://127.0.0.1:16666/
 | Other Linux Wayland desktops | Possible, not guaranteed | Core pieces may work if PipeWire, `/dev/input`, `ydotool`, and `wl-copy` are available. GNOME shortcut and top-bar integration are GNOME-specific. |
 | Linux X11 | Not supported | The app is designed around Wayland-era input and clipboard tools. |
 | macOS | Not supported | No recording, hotkey, service, or output backend is implemented for macOS. |
-| Windows | Porting groundwork only | The output layer has a Windows `SendInput`/Win32 clipboard backend, but the full daemon is not yet a Windows app. Recording, global hotkeys, service install, tray UI, and model setup still need Windows-specific work. |
+| Windows | Supported (desktop daemon) | Native port: WASAPI recording via `sounddevice`, global hold-to-record hotkey via a low-level keyboard hook, `SendInput`/Win32 clipboard output, `winsound` cues, a system tray icon with state colors, and CUDA GPU transcription through the same worker venv. See "Windows setup" below. |
 | WSL / WSLg | Not supported | Global hotkeys, audio capture, and focused-app input are host-desktop problems, not normal WSL process capabilities. |
 
 The app currently works best as a desktop daemon on GNOME Wayland. The code is
@@ -49,13 +49,12 @@ being kept portable where practical, but the shipping workflow is Linux-first.
 
 MyWhispr separates transcription from output transport:
 
-- Short printable ASCII text is typed directly through the synthetic-input
-  backend. This avoids application-specific paste handling and keeps command
-  snippets responsive.
-- Longer text and non-ASCII text use clipboard paste fallback.
+- Text is pasted through the clipboard first for fast bulk insertion.
+- If clipboard paste fails, short printable ASCII text can fall back to the
+  synthetic-input backend.
 - On Linux Wayland, output uses `ydotool` plus `wl-copy --paste-once`.
 - On Windows, the output backend maps the same operations to `SendInput` and
-  the Win32 clipboard, but the rest of the app still needs a Windows port.
+  the Win32 clipboard.
 
 This is intentionally content-agnostic. MyWhispr does not special-case phrases
 or leading words to decide whether insertion should work.
@@ -81,20 +80,79 @@ sudo apt install pipewire-bin wl-clipboard ydotool python3-evdev python3-pyudev 
 
 ## Install
 
-Clone the repo and create a local config:
+### Windows
+
+Clone the repo, then run the installer from PowerShell:
+
+```powershell
+git clone https://github.com/ibmua/MyWhispr.git
+cd MyWhispr
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+The Windows installer is idempotent. It creates `.venv`, `.venv-gpu-asr`, and
+an isolated `.venv-qwen-asr` runtime, installs runtime dependencies, downloads
+the whisper.cpp CUDA server build (for the quantized GGML Whisper models),
+writes a working `config.json`, downloads the default Parakeet model into the
+Hugging Face cache, and then stops. Qwen runs in its own virtualenv because its
+package pins an older Transformers release than Parakeet needs. The installer
+does not create startup entries or launch a hidden background process unless
+you ask it to.
+
+Start MyWhispr when setup is done:
+
+```powershell
+.\bin\mywhisprd.cmd
+```
+
+Then open the control panel:
+
+```text
+http://127.0.0.1:16666/
+```
+
+Optional installer switches:
+
+```powershell
+# Set up Python environments and config without downloading model weights.
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -SkipModelDownload
+
+# Skip the optional isolated Qwen runtime.
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -SkipQwenBackend
+
+# Launch MyWhispr after setup.
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Start
+
+# Create Start Menu and login startup shortcuts.
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -CreateStartMenuShortcut -CreateStartupShortcut
+
+# Skip the ~460 MB whisper.cpp CUDA server download (GGML models stay disabled).
+PowerShell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -SkipWhisperServer
+```
+
+Older `-NoStart` and `-NoStartupShortcut` flags are still accepted for scripts
+that already use them, but starting and startup shortcuts are now opt-in.
+
+
+Whisper.cpp GGML models (including the quantized Whisper Large v3 Q5) download
+with one click from the web UI once `whisper_server_binary` points to a
+`whisper-server.exe`; the installer sets this up automatically. If the binary
+is missing the cards stay visible but disabled, avoiding the first-run trap
+where a local model file exists but no server executable can run it.
+
+**Antivirus note:** the prebuilt `whisper-server.exe` is unsigned, and some
+antivirus products (notably Avast/AVG with a generic `IDP.Generic` verdict from
+"behavior analysis") silently freeze its network threads or quarantine it. The
+symptom is a GGML model that loads but never becomes ready. Add an exclusion
+for the MyWhispr folder in your antivirus settings; the Python-based GPU models
+(Parakeet, Qwen, etc.) are unaffected.
+
+### Linux / GNOME
 
 ```bash
 git clone https://github.com/ibmua/MyWhispr.git
 cd MyWhispr
 cp config.example.json config.json
-```
-
-Edit `config.json` for your local model paths, ASR Python environments, audio
-input device, trigger key, and shortcut preferences.
-
-Install the user service and GNOME shortcut:
-
-```bash
 ./scripts/install.sh
 ```
 
@@ -103,6 +161,17 @@ Open the local UI:
 ```bash
 xdg-open http://127.0.0.1:16666/
 ```
+
+## Windows Notes
+
+The installer sets `"gpu_asr_python": "./.venv-gpu-asr/Scripts/python.exe"` and
+uses `parakeet-tdt-0.6b-v3` as the first-run default. Qwen model entries point
+at `./.venv-qwen-asr/bin/python`, which resolves to the Windows
+`Scripts\python.exe` path at runtime. Workers use offline model loading, so the
+installer downloads Parakeet during setup by default and the UI downloader
+caches additional model weights before loading them. The tray icon shows daemon
+state; the trigger key from `triggers` (grave by default) is captured by a
+global keyboard hook, so it does not type into the focused app.
 
 ## Daily Use
 
@@ -117,6 +186,12 @@ The default workflow is:
 Combo shortcuts can switch language or mode while the trigger is held. For
 example, a setup can use one combo key for English, another for Ukrainian, and
 another for non-streaming dictation.
+
+You do not have to wait for the previous take to finish: as soon as the trigger
+is released the next press starts a new recording immediately, while the
+previous recording is transcribed and inserted in the background. Takes queue
+up and land in the order they were spoken; the web UI header shows how many are
+still in flight.
 
 ## Commands
 
@@ -141,6 +216,7 @@ HF cache:
 
 ```bash
 ./scripts/download-gpu-asr-model.sh parakeet-tdt-0.6b-v3
+./scripts/download-gpu-asr-model.sh qwen3-asr-0.6b
 ./scripts/download-gpu-asr-model.sh canary-1b-v2
 ```
 

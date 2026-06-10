@@ -144,7 +144,10 @@ function HistoryCard({ history, activeModel, models, onCopy, onClear, onRetransl
   }, [history]);
 
   const modelOptions = useMemo(() => {
-    return ((models && models.items) || []).filter((m) => m.exists);
+    return ((models && models.items) || []).filter((m) => {
+      const downloading = m.download && m.download.state === "downloading";
+      return m.exists && m.selectable !== false && !m.unavailable_reason && !downloading;
+    });
   }, [models]);
 
   useEffect(() => {

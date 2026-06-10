@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ log = logging.getLogger(__name__)
 DEFAULT_CONFIG: dict[str, Any] = {
     "runtime_dir": None,
     "socket_path": None,
-    "default_model": "remote-large-q5",
+    "default_model": "parakeet-tdt-0.6b-v3",
     "preload_default_model_on_startup": True,
     "models": copy.deepcopy(BUILTIN_MODEL_OPTIONS),
     "gpu_asr_python": "",
@@ -35,7 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "api_key": "",
         "advertised_host": "",
         "advertised_scheme": "http",
-        "model_name": "remote-large-q5",
+        "model_name": "parakeet-tdt-0.6b-v3",
     },
     "history_limit": 20,
     "maximum_recording_seconds": 240,
@@ -52,6 +53,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "type_key_delay_ms": 0,
     "direct_type_max_chars": 240,
     "direct_type_ascii_only": True,
+    "prefer_clipboard_paste": True,
     "script_timeout_seconds": 45,
     "modes": {
         "uk": {"label": "Ukrainian", "type": "language", "language": "uk"},
@@ -72,12 +74,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "streaming": {
         "app_output_enabled": True,
-        "interval_seconds": 0.8,
-        "initial_delay_seconds": 1.2,
-        "stable_lag_seconds": 0.65,
+        "interval_seconds": 0.45,
+        "initial_delay_seconds": 0.35,
+        "stable_lag_seconds": 0.35,
         "max_rewrite_chars": 180,
         "rewrite_backspace_confirmations": 2,
-        "initial_commit_confirmations": 2,
+        "initial_commit_confirmations": 1,
         "crystallization_enabled": True,
         "crystallization_lag_seconds": 24,
         "crystallization_required_updates": 2,
@@ -171,6 +173,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def _runtime_defaults() -> dict[str, Any]:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "MyWhispr"
+        return {"runtime_dir": str(base / "runtime"), "socket_path": str(base / "control.sock")}
     uid = os.getuid()
     rd = f"/run/user/{uid}/mywhispr"
     sock = f"/run/user/{uid}/mywhispr.sock"
@@ -181,7 +186,7 @@ def load_config(path: Path) -> "Config":
     raw: dict[str, Any] = {}
     if path.exists():
         try:
-            raw = json.loads(path.read_text())
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             raise ConfigError(f"failed to parse {path}: {e}") from e
     merged = _deep_merge(DEFAULT_CONFIG, _runtime_defaults())
@@ -240,10 +245,11 @@ def _validate(cfg: dict) -> None:
     models = cfg.get("models", {}) or {}
     normalized_models = {name: normalize_model_spec(name, raw) for name, raw in models.items()}
     needs_whisper_binary = any(spec.get("backend") == "whisper.cpp" for spec in normalized_models.values())
-    if needs_whisper_binary and not binary:
-        raise ConfigError("whisper_server_binary is required")
-    if binary and (not Path(binary).is_file() or not os.access(binary, os.X_OK)):
-        raise ConfigError(f"whisper_server_binary not executable: {binary}")
+    binary_usable = bool(binary) and Path(binary).is_file() and os.access(binary, os.X_OK)
+    if needs_whisper_binary and not binary_usable:
+        # whisper.cpp models stay listed but unselectable; GPU and external API
+        # models must keep working without a whisper-server binary installed.
+        log.warning("whisper_server_binary missing or not executable (%r); whisper.cpp models disabled", binary)
     default_model = cfg.get("default_model") or ""
     if default_model and default_model not in models:
         log.warning("default_model %r not in models; clearing", default_model)
@@ -304,7 +310,7 @@ def _validate(cfg: dict) -> None:
 
 def atomic_write_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -353,7 +359,7 @@ class Config:
 
     def reload_from_disk(self) -> None:
         try:
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             log.error("config reload failed: %s", e)
             return

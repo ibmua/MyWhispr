@@ -9,8 +9,10 @@ class State(enum.Enum):
     RECORDING = "RECORDING"
     STOPPING = "STOPPING"
     STOPPING_NO_PASTE = "STOPPING_NO_PASTE"
+    # TRANSCRIBING/PASTING are no longer FSM states: finished recordings are
+    # queued and processed in the background so a new recording can start
+    # immediately. They remain here as display states for the UI/tray.
     TRANSCRIBING = "TRANSCRIBING"
-    TRANSCRIBING_NO_PASTE = "TRANSCRIBING_NO_PASTE"
     PASTING = "PASTING"
 
 
@@ -26,11 +28,6 @@ class Event(enum.Enum):
     MAX_DURATION = "max_duration"
     RECORDER_EXITED_ERROR = "recorder_exited_error"
     RECORDER_STOPPED = "recorder_stopped"
-    TRANSCRIPT_READY = "transcript_ready"
-    TRANSCRIPT_FAILED = "transcript_failed"
-    NO_TEXT = "no_text"
-    PASTE_DONE = "paste_done"
-    PASTE_FAILED = "paste_failed"
 
 
 # Events that may be received but are explicitly ignored in some states; declared
@@ -46,24 +43,11 @@ IGNORED_BY_DESIGN: set[tuple[State, Event]] = {
     (State.STOPPING, Event.COMBO),
     (State.STOPPING, Event.NOSTREAM),
     (State.STOPPING, Event.LOWERCASE_INITIAL),
+    (State.STOPPING, Event.START),
     (State.STOPPING_NO_PASTE, Event.RELEASE),
     (State.STOPPING_NO_PASTE, Event.COMBO),
     (State.STOPPING_NO_PASTE, Event.NOSTREAM),
     (State.STOPPING_NO_PASTE, Event.LOWERCASE_INITIAL),
-    (State.TRANSCRIBING, Event.RELEASE),
-    (State.TRANSCRIBING, Event.COMBO),
-    (State.TRANSCRIBING, Event.NOSTREAM),
-    (State.TRANSCRIBING, Event.LOWERCASE_INITIAL),
-    (State.TRANSCRIBING, Event.START),
-    (State.TRANSCRIBING_NO_PASTE, Event.RELEASE),
-    (State.TRANSCRIBING_NO_PASTE, Event.COMBO),
-    (State.TRANSCRIBING_NO_PASTE, Event.NOSTREAM),
-    (State.TRANSCRIBING_NO_PASTE, Event.LOWERCASE_INITIAL),
-    (State.TRANSCRIBING_NO_PASTE, Event.START),
-    (State.PASTING, Event.RELEASE),
-    (State.PASTING, Event.COMBO),
-    (State.PASTING, Event.NOSTREAM),
-    (State.PASTING, Event.LOWERCASE_INITIAL),
-    (State.PASTING, Event.START),
+    (State.STOPPING_NO_PASTE, Event.START),
     (State.RECORDING, Event.START),
 }

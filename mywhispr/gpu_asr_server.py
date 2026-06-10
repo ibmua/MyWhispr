@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import locale
 import logging
 import os
 import signal
@@ -12,9 +13,47 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from .model_specs import normalize_model_spec
+from .model_specs import normalize_model_spec, resolve_project_python
 
 log = logging.getLogger(__name__)
+
+
+def _worker_json_fallback_encodings() -> list[str]:
+    encodings = [
+        locale.getpreferredencoding(False),
+        "mbcs" if sys.platform == "win32" else "",
+        "cp1251",
+        "cp866",
+        "cp1252",
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for enc in encodings:
+        if not enc:
+            continue
+        key = enc.lower().replace("_", "-")
+        if key in {"utf-8", "utf8"} or key in seen:
+            continue
+        seen.add(key)
+        out.append(enc)
+    return out
+
+
+def _decode_worker_json_line(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as utf8_error:
+        for enc in _worker_json_fallback_encodings():
+            try:
+                text = raw.decode(enc)
+            except (LookupError, UnicodeDecodeError):
+                continue
+            log.warning("GPU ASR worker emitted non-UTF-8 JSON; decoded as %s", enc)
+            return text
+        preview = raw[:160].decode("ascii", "backslashreplace")
+        raise RuntimeError(
+            f"GPU ASR worker emitted non-UTF-8 JSON: {utf8_error}; raw={preview!r}"
+        ) from utf8_error
 
 
 class GpuAsrServer:
@@ -206,20 +245,55 @@ class GpuAsrServer:
 
     def _python_for_model(self, model: str) -> str:
         spec = normalize_model_spec(model, self.models.get(model))
-        return str(spec.get("python") or spec.get("gpu_asr_python") or self.default_python)
+        candidates = [
+            str(spec.get("python") or ""),
+            str(spec.get("gpu_asr_python") or ""),
+            str(self.default_python or ""),
+        ]
+        first: Path | None = None
+        for cand in candidates:
+            if not cand:
+                continue
+            exe = self._resolve_python(cand)
+            if first is None:
+                first = exe
+            if exe.is_file():
+                if cand != candidates[0] and candidates[0]:
+                    log.warning(
+                        "model %s python %r not found; using %s", model, candidates[0], exe
+                    )
+                return str(exe)
+        return str(first or sys.executable)
 
-    async def _spawn_locked(self, python: str) -> bool:
+    def set_default_python(self, python: str) -> None:
+        self.default_python = python or sys.executable
+
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    def _resolve_python(self, python: str) -> Path:
+        return resolve_project_python(python, self._project_root())
+
+    async def _spawn_locked(self, python: str | Path) -> bool:
         self._ready.clear()
         self.last_error = ""
         self.loaded_model = None
         self.loaded_backend = ""
         self.device_report = {}
-        root = Path(__file__).resolve().parent.parent
+        root = self._project_root()
         env = os.environ.copy()
         env.setdefault("HF_HUB_OFFLINE", "1")
         env.setdefault("TRANSFORMERS_OFFLINE", "1")
-        args = [python, "-m", "mywhispr.gpu_asr_worker"]
-        log.info("starting GPU ASR worker name=%s", self.name)
+        # Worker protocol is UTF-8 JSON lines; override any inherited Windows
+        # ANSI-codepage setting so non-ASCII transcripts do not break RPC.
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        exe = self._resolve_python(str(python))
+        if not exe.is_file():
+            self.last_error = f"python missing: {exe}"
+            return False
+        args = [str(exe), "-m", "mywhispr.gpu_asr_worker"]
+        log.info("starting GPU ASR worker name=%s python=%s", self.name, exe)
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 *args,
@@ -230,9 +304,9 @@ class GpuAsrServer:
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError as e:
-            self.last_error = f"python missing: {e}"
+            self.last_error = f"python missing: {exe}: {e}"
             return False
-        self._running_python = python
+        self._running_python = str(exe)
         self._stderr_tail.clear()
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         return True
@@ -250,7 +324,7 @@ class GpuAsrServer:
             if not raw:
                 raise RuntimeError(f"GPU ASR worker closed stdout: {self._tail_text()}")
             self._last_used = time.monotonic()
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(_decode_worker_json_line(raw))
 
     def _finish_detached_request(self, task: asyncio.Task) -> None:
         try:
