@@ -251,7 +251,10 @@ class StreamingSession:
                 continue
             if end <= cutoff:
                 parts.append(str(seg.get("text") or ""))
-        stable = text_cleanup.collapse_whitespace(" ".join(parts))
+        # Concatenate, do NOT space-join: segment texts already carry their own
+        # leading space at word boundaries and none mid-word, so " ".join would
+        # inject a spurious space whenever a segment starts mid-word.
+        stable = text_cleanup.collapse_whitespace("".join(parts))
         if stable:
             return stable
         # Fallback for server responses without useful segment timing.

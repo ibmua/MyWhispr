@@ -104,8 +104,10 @@ class Transcriber:
             )
             elapsed = _t.monotonic() - t0
             elapsed = float(data.get("elapsed_seconds") or elapsed)
-            raw = (data.get("text") or "").strip()
             segments = data.get("segments") or []
+            raw = text_cleanup.text_from_segments(
+                segments, fallback=data.get("text") or ""
+            ).strip()
             cleaned = self._clean(raw, wav_bytes=wav_bytes, language=language)
             return TranscriptionResult(
                 text=cleaned,
@@ -156,8 +158,10 @@ class Transcriber:
                 data = await _do()
         finally:
             server.release_slot()
-        raw = (data.get("text") or "").strip()
         segments = data.get("segments") or []
+        raw = text_cleanup.text_from_segments(
+            segments, fallback=data.get("text") or ""
+        ).strip()
         cleaned = self._clean(raw, wav_bytes=wav_bytes, language=language)
         return TranscriptionResult(
             text=cleaned,
