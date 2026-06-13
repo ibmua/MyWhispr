@@ -17,8 +17,36 @@ from .model_specs import LANGUAGE_NAMES, model_source, normalize_model_spec
 
 
 log = logging.getLogger(__name__)
-JSON_STDOUT = sys.stdout
-sys.stdout = sys.stderr
+_JSON_STDOUT: Any | None = None
+
+
+def _setup_stdio_protocol() -> None:
+    """Keep worker RPC bytes UTF-8 even on Windows ANSI-codepage systems."""
+    global _JSON_STDOUT
+    if _JSON_STDOUT is not None:
+        return
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        _JSON_STDOUT = os.fdopen(os.dup(sys.stdout.fileno()), "wb", buffering=0)
+        try:
+            os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        except OSError:
+            pass
+    except Exception:
+        _JSON_STDOUT = getattr(sys.stdout, "buffer", sys.stdout)
+    sys.stdout = sys.stderr
+
+
+def _stdin_json_lines():
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is not None:
+        for raw in buffer:
+            yield raw.decode("utf-8")
+        return
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    yield from sys.stdin
 
 SEAMLESS_LANGUAGE_CODES = {
     "ar": "arb",
@@ -60,7 +88,16 @@ SEAMLESS_LANGUAGE_CODES = {
 
 
 def _reply(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, ensure_ascii=False), file=JSON_STDOUT, flush=True)
+    global _JSON_STDOUT
+    if _JSON_STDOUT is None:
+        _setup_stdio_protocol()
+    data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    assert _JSON_STDOUT is not None
+    try:
+        _JSON_STDOUT.write(data)
+    except TypeError:
+        _JSON_STDOUT.write(data.decode("utf-8"))
+    _JSON_STDOUT.flush()
 
 
 def _torch_dtype(torch, value: Any):
@@ -623,12 +660,13 @@ class Worker:
 
 
 def main() -> int:
+    _setup_stdio_protocol()
     logging.basicConfig(
         level=os.environ.get("MYWHISPR_GPU_WORKER_LOG", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     worker = Worker()
-    for line in sys.stdin:
+    for line in _stdin_json_lines():
         try:
             req = json.loads(line)
             cmd = req.get("cmd")

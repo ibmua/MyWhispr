@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
 WHISPER_CPP_BACKENDS = {"whisper.cpp", "whisper_cpp", "whisper"}
+WHISPER_CPP_REPO_ID = "ggerganov/whisper.cpp"
 GPU_BACKENDS = {
     "qwen_asr",
     "transformers_tdt",
@@ -23,6 +24,7 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
     "qwen3-asr-1.7b": {
         "backend": "qwen_asr",
         "repo_id": "Qwen/Qwen3-ASR-1.7B",
+        "python": "./.venv-qwen-asr/bin/python",
         "device": "cuda:0",
         "dtype": "bfloat16",
         "local_files_only": True,
@@ -56,6 +58,7 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
         ],
         "live_preview": True,
         "install_hint": "pip install -U torch transformers",
+        "download_exclude": ["*.nemo", "plots/*"],
     },
     "granite-speech-4.1-2b": {
         "backend": "transformers_speech_seq2seq",
@@ -72,6 +75,7 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
         "prompt": "<|audio|>transcribe the speech in {language} with proper punctuation and capitalization.",
         "live_preview": True,
         "install_hint": "pip install -U torch transformers torchaudio soundfile",
+        "download_exclude": [".eval_results/*"],
     },
     "cohere-transcribe-03-2026": {
         "backend": "cohere_asr",
@@ -88,6 +92,7 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
         "fallback_language": "en",
         "live_preview": True,
         "install_hint": "pip install -U 'transformers>=5.4.0' torch soundfile librosa sentencepiece protobuf",
+        "download_exclude": [".eval_results/*", "assets/*", "demo/*"],
     },
     "canary-qwen-2.5b": {
         "backend": "nemo_salm",
@@ -150,6 +155,7 @@ HF_GPU_MODEL_OPTIONS: dict[str, dict[str, Any]] = {
     "qwen3-asr-0.6b": {
         "backend": "qwen_asr",
         "repo_id": "Qwen/Qwen3-ASR-0.6B",
+        "python": "./.venv-qwen-asr/bin/python",
         "device": "cuda:0",
         "dtype": "bfloat16",
         "local_files_only": True,
@@ -328,6 +334,12 @@ def normalize_model_spec(name: str, raw: Any) -> dict[str, Any]:
             "live_preview": False,
         }
     spec = dict(raw)
+    # Config entries are often bare ({"backend":..., "repo_id":...}); fill
+    # label/description/languages/install_hint from the built-in catalog so
+    # the UI always has real model info.
+    builtin = BUILTIN_MODEL_OPTIONS.get(name)
+    if builtin:
+        spec = {**builtin, **{k: v for k, v in raw.items() if v is not None}}
     spec["name"] = name
     spec["backend"] = normalize_backend(spec.get("backend"))
     spec.setdefault("label", name)
@@ -374,6 +386,61 @@ def model_source(spec: dict[str, Any]) -> str:
     return str(spec.get("local_path") or spec.get("repo_id") or spec.get("path") or "")
 
 
+def resolve_project_python(python: str, root: Path) -> Path:
+    """Resolve a configured interpreter path against the project root.
+
+    Specs may carry the other platform's venv layout (Linux ``bin/python`` vs
+    Windows ``Scripts\\python.exe``); map between them so one config works on
+    both platforms.
+    """
+    exe = Path(str(python or ""))
+    if not exe.is_absolute():
+        exe = (root / exe).resolve()
+    if exe.is_file():
+        return exe
+    parts = exe.parts
+    if len(parts) >= 2:
+        name = parts[-1].lower()
+        parent = parts[-2].lower()
+        if parent == "bin" and name in {"python", "python3"}:
+            alt = Path(*parts[:-2]) / "Scripts" / "python.exe"
+            if alt.is_file():
+                return alt
+        elif parent == "scripts" and name in {"python.exe", "python", "python3.exe"}:
+            alt = Path(*parts[:-2]) / "bin" / "python"
+            if alt.is_file():
+                return alt
+    return exe
+
+
+def _path_filename(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if "\\" in raw:
+        return PureWindowsPath(raw).name
+    return Path(raw).name
+
+
+def whisper_cpp_download_url(spec: dict[str, Any]) -> str:
+    explicit = str(spec.get("download_url") or spec.get("url") or "").strip()
+    if explicit:
+        return explicit
+    if spec.get("backend") != "whisper.cpp":
+        return ""
+    filename = _path_filename(spec.get("download_filename") or spec.get("path"))
+    if not filename:
+        return ""
+    repo_id = str(
+        spec.get("download_repo_id")
+        or spec.get("repo_id")
+        or WHISPER_CPP_REPO_ID
+    ).strip()
+    if not repo_id:
+        return ""
+    return f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
+
+
 def external_api_key_configured(spec: dict[str, Any]) -> bool:
     if not bool(spec.get("api_key_required", True)):
         return True
@@ -405,8 +472,20 @@ def hf_cache_state(spec: dict[str, Any]) -> bool | None:
     if not repo_id:
         return None
     root = hf_cache_path(str(repo_id))
+    blobs = root / "blobs"
+    if blobs.is_dir():
+        try:
+            if any(blobs.glob("*.incomplete")):
+                return False
+        except OSError:
+            return False
     snapshots = root / "snapshots"
-    return snapshots.is_dir() and any(snapshots.iterdir())
+    if not snapshots.is_dir():
+        return False
+    try:
+        return any(p.is_dir() and any(p.iterdir()) for p in snapshots.iterdir())
+    except OSError:
+        return False
 
 
 def model_availability(spec: dict[str, Any]) -> dict[str, Any]:
@@ -427,17 +506,28 @@ def model_availability(spec: dict[str, Any]) -> dict[str, Any]:
         path = Path(str(spec.get("path") or ""))
         exists = path.is_file()
         size = path.stat().st_size if exists else 0
-        return {"exists": exists, "selectable": exists, "cached": None, "size_bytes": size}
+        return {
+            "exists": exists,
+            "selectable": exists,
+            "cached": None,
+            "size_bytes": size,
+            "downloadable": bool(whisper_cpp_download_url(spec)),
+        }
     local_path = spec.get("local_path")
     if local_path:
         path = Path(str(local_path))
         exists = path.exists()
         return {"exists": exists, "selectable": exists, "cached": exists, "size_bytes": 0}
     cached = hf_cache_state(spec)
-    # Hugging Face options stay selectable even before the weights are cached:
-    # selecting them should update default_model and surface the precise worker
-    # error/dependency hint instead of making the UI look immutable.
-    return {"exists": True, "selectable": True, "cached": cached, "size_bytes": 0}
+    repo_id = bool(str(spec.get("repo_id") or "").strip())
+    exists = bool(cached)
+    return {
+        "exists": exists,
+        "selectable": exists,
+        "cached": cached,
+        "size_bytes": 0,
+        "downloadable": repo_id and not exists,
+    }
 
 
 def default_languages_for_spec(spec: dict[str, Any]) -> list[str]:
@@ -460,10 +550,14 @@ def public_model_card(name: str, raw: Any) -> dict[str, Any]:
         "backend": spec.get("backend"),
         "path": model_source(spec),
         "repo_id": spec.get("repo_id") or "",
+        "download_url": whisper_cpp_download_url(spec),
+        "downloadable": bool(whisper_cpp_download_url(spec)),
         "description": spec.get("description") or "",
         "subdescription": spec.get("subdescription"),
         "languages": languages,
         "install_hint": spec.get("install_hint") or "",
+        "device": spec.get("device") or "",
+        "dtype": str(spec.get("dtype") or ""),
         "live_preview": bool(spec.get("live_preview", False)),
         "provider": spec.get("provider") or "",
         "api_base_url": spec.get("api_base_url") or "",

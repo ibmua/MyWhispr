@@ -54,8 +54,15 @@ async def _amain() -> int:
         log.info("signal %s received; shutting down", signame)
         stop_event.set()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_signal, sig.name)
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _handle_signal, sig.name)
+    except NotImplementedError:
+        # Windows: no loop signal handlers; fall back to classic handlers.
+        for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", signal.SIGTERM)):
+            signal.signal(sig, lambda *_a, s=sig: loop.call_soon_threadsafe(_handle_signal, signal.Signals(s).name))
+
+    daemon.request_shutdown = lambda: loop.call_soon_threadsafe(stop_event.set)
 
     try:
         await stop_event.wait()

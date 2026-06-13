@@ -2,6 +2,7 @@ logs/
 recordings/
 
 models/
+tools/
 .venv*/
 
 config.json

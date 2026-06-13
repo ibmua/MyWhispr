@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +135,17 @@ class ShortcutManager:
     async def snapshot(self, triggers: dict[str, Any]) -> dict[str, Any]:
         installed: dict[str, Any] = {}
         error = ""
+        if sys.platform == "win32":
+            # The keyboard hook reads stop_on_release_codes straight from the
+            # config; there is no desktop-level binding to install.
+            return {
+                "presets": KEY_PRESETS,
+                "combo_presets": COMBO_KEY_PRESETS,
+                "languages": WHISPER_LANGUAGES,
+                "triggers": triggers,
+                "installed": installed,
+                "error": error,
+            }
         try:
             raw = await self._get(SCHEMA, "custom-keybindings")
             paths = _parse_paths(raw)
@@ -161,6 +173,8 @@ class ShortcutManager:
         }
 
     async def install_trigger(self, *, trigger: str, binding: str) -> tuple[bool, str, str]:
+        if sys.platform == "win32":
+            return True, "handled by keyboard hook", ""
         command = self.command_for(trigger)
         name = f"MyWhispr {trigger}"
         our_path = f"{PATH_PREFIX}/mywhispr-{trigger}/"
@@ -193,6 +207,8 @@ class ShortcutManager:
         return True, "updated", path
 
     async def remove_trigger(self, *, trigger: str) -> tuple[bool, str]:
+        if sys.platform == "win32":
+            return True, "removed"
         command = self.command_for(trigger)
         name = f"MyWhispr {trigger}"
         try:

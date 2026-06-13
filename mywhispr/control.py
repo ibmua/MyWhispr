@@ -4,20 +4,30 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+WINDOWS_CONTROL_PORT = 16667
+
 
 class ControlSocketServer:
-    """Unix-socket JSON line protocol. Used by mywhisprctl (GNOME shortcut)."""
+    """JSON line protocol for mywhisprctl. Unix socket on Linux (GNOME
+    shortcut helper); loopback TCP on Windows where unix sockets are not
+    available to asyncio."""
 
-    def __init__(self, path: Path, handler) -> None:
+    def __init__(self, path: Path, handler, *, tcp_port: int = WINDOWS_CONTROL_PORT) -> None:
         self.path = path
         self.handler = handler
+        self.tcp_port = tcp_port
         self.server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        if sys.platform == "win32":
+            self.server = await asyncio.start_server(self._client, host="127.0.0.1", port=self.tcp_port)
+            log.info("control socket listening tcp=127.0.0.1:%d", self.tcp_port)
+            return
         try:
             if self.path.exists():
                 self.path.unlink()
@@ -65,6 +75,8 @@ class ControlSocketServer:
             except Exception:
                 pass
             self.server = None
+        if sys.platform == "win32":
+            return
         try:
             if self.path.exists():
                 self.path.unlink()

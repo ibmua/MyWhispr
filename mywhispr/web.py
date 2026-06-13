@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import re
 import socket
 from pathlib import Path
@@ -117,6 +118,11 @@ def _external_api_spec_from_body(name: str, body: dict, existing: dict | None = 
     return spec
 
 
+def _whisper_binary_usable(config: dict) -> bool:
+    binary = str(config.get("whisper_server_binary") or "").strip()
+    return bool(binary) and Path(binary).is_file() and os.access(binary, os.X_OK)
+
+
 def build_app(daemon, webui_dir: Path) -> web.Application:
     app = web.Application()
     app["daemon"] = daemon
@@ -168,7 +174,6 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
                 {"ok": False, "model": model, "last_error": f"unknown model {model!r}"},
                 status=400,
             )
-        daemon.config.set("default_model", model)
         ok = await daemon.warm_model(model)
         return web.json_response({"ok": ok, "model": model, "last_error": daemon.primary_server.last_error})
 
@@ -179,11 +184,23 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
         items = []
         for name, raw_model in models.items():
             card = public_model_card(name, raw_model)
+            spec = normalize_model_spec(name, raw_model)
+            download = daemon.model_downloads.status_for(name)
+            if download and download.get("state") == "downloading":
+                card["exists"] = False
+                card["selectable"] = False
+                card["cached"] = False
+            if spec.get("backend") == "whisper.cpp" and not _whisper_binary_usable(daemon.config.snapshot()):
+                card["selectable"] = False
+                card["unavailable_reason"] = (
+                    "Set whisper_server_binary to a whisper.cpp server executable before selecting this model."
+                )
             items.append({
                 **card,
                 "default": name == default_model,
                 "loaded": name == loaded_model,
                 "running": name == loaded_model and daemon.primary_server.is_running(),
+                "download": download,
             })
         return web.json_response({
             "items": items,
@@ -191,6 +208,18 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
             "loaded_model": loaded_model,
             "server": daemon.primary_server.status(),
         })
+
+    async def api_model_download(request):
+        name = request.match_info["name"]
+        try:
+            ok, reason = await daemon.start_model_download(name)
+        except Exception as e:
+            log.exception("model download start failed")
+            return web.json_response({"ok": False, "reason": str(e)}, status=500)
+        return web.json_response(
+            {"ok": ok, "reason": reason, "download": daemon.model_downloads.status_for(name)},
+            status=200 if ok else 409,
+        )
 
     async def api_model_unload(_request):
         await daemon.unload_model()
@@ -345,6 +374,7 @@ def build_app(daemon, webui_dir: Path) -> web.Application:
     app.router.add_post("/api/model/warm", api_model_warm)
     app.router.add_get("/api/models", api_models)
     app.router.add_post("/api/models/external", api_model_external_save)
+    app.router.add_post("/api/models/{name}/download", api_model_download)
     app.router.add_delete("/api/models/{name}", api_model_delete)
     app.router.add_post("/api/model/unload", api_model_unload)
     app.router.add_post("/api/recording/stop", api_recording_stop)

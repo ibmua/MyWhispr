@@ -24,6 +24,7 @@ SHIFT_UP = "42:0"
 DEFAULT_PASTE_KEY_DELAY_MS = 18
 DEFAULT_TYPE_KEY_DELAY_MS = 0
 DEFAULT_DIRECT_TYPE_MAX_CHARS = 240
+DEFAULT_PREFER_CLIPBOARD_PASTE = True
 _CLIPBOARD_SNAPSHOT_TIMEOUT_SECONDS = 1.0
 
 _ASCII_KEYCODES = {
@@ -686,23 +687,35 @@ def _windows_send(inputs) -> bool:
     return True
 
 
+def _windows_send_unicode_units(units: list[int]) -> bool:
+    _ctypes, _keybdinput, _input_union, input_type = _windows_input_types()
+    keyeventf_keyup = 0x0002
+    keyeventf_unicode = 0x0004
+    events = []
+    for unit in units:
+        events.append(_windows_key_input(0, unit, keyeventf_unicode))
+        events.append(_windows_key_input(0, unit, keyeventf_unicode | keyeventf_keyup))
+    inputs = (input_type * len(events))(*events)
+    return _windows_send(inputs)
+
+
 def _windows_type_text(text: str, delay_ms: int) -> bool:
     import time
 
-    ctypes, _keybdinput, _input_union, input_type = _windows_input_types()
-    keyeventf_keyup = 0x0002
-    keyeventf_unicode = 0x0004
     encoded = text.encode("utf-16-le")
     units = [int.from_bytes(encoded[i : i + 2], "little") for i in range(0, len(encoded), 2)]
+    if not units:
+        return True
+    if delay_ms <= 0:
+        chunk_size = 512
+        for i in range(0, len(units), chunk_size):
+            if not _windows_send_unicode_units(units[i : i + chunk_size]):
+                return False
+        return True
     for unit in units:
-        inputs = (input_type * 2)(
-            _windows_key_input(0, unit, keyeventf_unicode),
-            _windows_key_input(0, unit, keyeventf_unicode | keyeventf_keyup),
-        )
-        if not _windows_send(inputs):
+        if not _windows_send_unicode_units([unit]):
             return False
-        if delay_ms > 0:
-            time.sleep(delay_ms / 1000)
+        time.sleep(delay_ms / 1000)
     return True
 
 
@@ -799,16 +812,34 @@ async def _paste_text(
     type_key_delay_ms: int,
     direct_type_max_chars: int,
     direct_type_ascii_only: bool,
+    prefer_clipboard_paste: bool,
     backend: OutputBackend | None = None,
 ) -> bool:
     if not text:
         return True
     out = backend or output_backend()
-    if should_direct_type(
+    direct_typable = should_direct_type(
         text,
         max_chars=direct_type_max_chars,
         ascii_only=direct_type_ascii_only,
-    ):
+    )
+    if prefer_clipboard_paste:
+        pasted = await out.paste_text(
+            text,
+            settle_seconds=settle_seconds,
+            consume_timeout=consume_timeout,
+            key_delay_ms=key_delay_ms,
+        )
+        if pasted:
+            return True
+        if direct_typable:
+            log.warning("clipboard paste failed; falling back to direct type chars=%d", len(text))
+            typed = await out.type_text(text, delay_ms=type_key_delay_ms)
+            if typed:
+                log.info("output method=type-fallback backend=%s chars=%d", out.name, len(text))
+                return True
+        return False
+    if direct_typable:
         typed = await out.type_text(text, delay_ms=type_key_delay_ms)
         if typed:
             log.info("output method=type backend=%s chars=%d", out.name, len(text))
@@ -831,6 +862,7 @@ async def paste_final(
     type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
     direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
     direct_type_ascii_only: bool = True,
+    prefer_clipboard_paste: bool = DEFAULT_PREFER_CLIPBOARD_PASTE,
     backend: OutputBackend | None = None,
 ) -> bool:
     return await _paste_text(
@@ -841,6 +873,7 @@ async def paste_final(
         type_key_delay_ms=type_key_delay_ms,
         direct_type_max_chars=direct_type_max_chars,
         direct_type_ascii_only=direct_type_ascii_only,
+        prefer_clipboard_paste=prefer_clipboard_paste,
         backend=backend,
     )
 
@@ -856,6 +889,7 @@ async def stream_replace(
     type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
     direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
     direct_type_ascii_only: bool = True,
+    prefer_clipboard_paste: bool = DEFAULT_PREFER_CLIPBOARD_PASTE,
     backend: OutputBackend | None = None,
 ) -> bool:
     """Backspace common-prefix divergence and append replacement text."""
@@ -884,6 +918,7 @@ async def stream_replace(
             type_key_delay_ms=type_key_delay_ms,
             direct_type_max_chars=direct_type_max_chars,
             direct_type_ascii_only=direct_type_ascii_only,
+            prefer_clipboard_paste=prefer_clipboard_paste,
             backend=out,
         )
         if not ok:

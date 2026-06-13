@@ -120,6 +120,21 @@ function App() {
     }
   }, [reloadConfig, reloadModels, flashNotice]);
 
+  const downloadModel = useCallback(async (name) => {
+    setModelBusy(true);
+    flashNotice("Downloading " + name + "...");
+    try {
+      const r = await API.postJSON("/api/models/" + encodeURIComponent(name) + "/download", {});
+      if (!r.ok) throw new Error(r.reason || "download failed");
+      await reloadModels();
+      flashNotice(r.reason || "Download started");
+    } catch (e) {
+      flashNotice("Download failed: " + e.message, "error");
+    } finally {
+      setModelBusy(false);
+    }
+  }, [reloadModels, flashNotice]);
+
   const unloadModel = useCallback(async () => {
     setModelBusy(true);
     try {
@@ -286,6 +301,7 @@ function App() {
         online={online}
         onRefresh={onRefresh}
         modelLoaded={modelLoaded}
+        queuePending={(snap && snap.queue_pending) || 0}
       />
       {notice && (
         <div className={`app-notice ${notice.kind === "error" ? "error" : ""}`}>{notice.text}</div>
@@ -305,6 +321,7 @@ function App() {
           models={models}
           activeModel={activeModel}
           onSelect={switchModel}
+          onDownload={downloadModel}
           onUnload={unloadModel}
           onSaveExternal={saveExternalModel}
           onDeleteModel={deleteModel}

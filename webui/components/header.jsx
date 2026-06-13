@@ -13,9 +13,11 @@ function Toggle({ on, onChange, accent = false, disabled = false }) {
   );
 }
 
-function Header({ state, model, online, onRefresh, modelLoaded }) {
+function Header({ state, model, online, onRefresh, modelLoaded, queuePending = 0 }) {
   const pill = statePill(state, online);
   const showGpuPill = !!modelLoaded && online;
+  // Recordings still being transcribed/inserted behind the live one.
+  const backlog = online ? Math.max(0, queuePending - (state === "TRANSCRIBING" || state === "PASTING" ? 1 : 0)) : 0;
   return (
     <header className="app-header">
       <div className="brand">
@@ -36,6 +38,11 @@ function Header({ state, model, online, onRefresh, modelLoaded }) {
           {pill.cls === "rec" ? <span className="dot"></span> : null}
           {pill.label}
         </span>
+        {backlog > 0 && (
+          <span className="pill busy" title="Earlier recordings still being transcribed and inserted">
+            {backlog} queued
+          </span>
+        )}
       </div>
       <div className="header-actions">
         <button className="btn" onClick={onRefresh}><Icon.Refresh /> Refresh</button>

@@ -95,8 +95,8 @@ class StreamingSession:
 
     async def _run(self) -> None:
         s = self.settings
-        initial_delay = float(s.get("initial_delay_seconds", 1.2))
-        interval = float(s.get("interval_seconds", 0.8))
+        initial_delay = float(s.get("initial_delay_seconds", 0.35))
+        interval = float(s.get("interval_seconds", 0.45))
         try:
             await asyncio.wait_for(self.cancel.wait(), timeout=initial_delay)
             return
@@ -241,7 +241,7 @@ class StreamingSession:
 
     def _stable_text(self, res, wav: bytes) -> str:
         s = self.settings
-        stable_lag = float(s.get("stable_lag_seconds", 0.65))
+        stable_lag = float(s.get("stable_lag_seconds", 0.35))
         cutoff = max(0.0, self._duration_seconds(wav) - stable_lag)
         parts: list[str] = []
         for seg in res.segments or []:
@@ -288,15 +288,16 @@ class StreamingSession:
         """Commit only the stable, repeatedly-seen prefix; cap destructive rewrites."""
         s = self.settings
         max_rewrite = int(s.get("max_rewrite_chars", 180))
-        init_conf = int(s.get("initial_commit_confirmations", 2))
+        init_conf = int(s.get("initial_commit_confirmations", 1))
         rewrite_conf = int(s.get("rewrite_backspace_confirmations", 2))
-        if not self._pause_gate_open(wav):
-            return
         stable = self.text_transform_provider(self._stable_text(res, wav))
         stable = self._apply_frozen_prefix(stable)
         if not stable:
             return
         if self.frozen_text and len(stable) < len(self.frozen_text):
+            return
+        is_append = stable.startswith(self.committed_text)
+        if not is_append and not self._pause_gate_open(wav):
             return
         key = stable
         self.confirmation_counts[key] = self.confirmation_counts.get(key, 0) + 1
@@ -305,7 +306,7 @@ class StreamingSession:
             required = 1
         # Stable strings that share a prefix with already-committed text are
         # additions and only need init_conf; full divergent rewrites need rewrite_conf.
-        if stable.startswith(self.committed_text):
+        if is_append:
             required = init_conf if not self.app_output_started else 1
         if self.confirmation_counts[key] < required:
             return
@@ -321,6 +322,9 @@ class StreamingSession:
             type_key_delay_ms=int(self.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
             direct_type_max_chars=int(self.config.get("direct_type_max_chars", 240)),
             direct_type_ascii_only=bool(self.config.get("direct_type_ascii_only", True)),
+            prefer_clipboard_paste=bool(
+                self.config.get("prefer_clipboard_paste", paste_mod.DEFAULT_PREFER_CLIPBOARD_PASTE)
+            ),
         )
         if not ok:
             log.warning("stream rewrite refused; leaving committed text untouched")

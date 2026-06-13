@@ -65,8 +65,9 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected command {args}")
 
         with patch.dict(paste.os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}):
-            with patch.object(paste, "_command_stdout", fake_command):
-                self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
+            with patch.object(paste.sys, "platform", "linux"):
+                with patch.object(paste, "_command_stdout", fake_command):
+                    self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
 
     async def test_layout_gate_fails_closed_when_only_stale_gsettings_exists(self) -> None:
         async def fake_command(args, *, timeout=0.5):
@@ -79,10 +80,41 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
             raise AssertionError(f"unexpected command {args}")
 
         with patch.dict(paste.os.environ, {"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}):
-            with patch.object(paste, "_command_stdout", fake_command):
-                self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
+            with patch.object(paste.sys, "platform", "linux"):
+                with patch.object(paste, "_command_stdout", fake_command):
+                    self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
 
-    async def test_short_printable_ascii_uses_type_before_clipboard(self) -> None:
+    async def test_short_printable_ascii_prefers_clipboard_by_default(self) -> None:
+        calls: list[tuple[str, str, int | None]] = []
+
+        class FakeBackend:
+            name = "fake"
+
+            async def type_text(self, text: str, *, delay_ms: int) -> bool:
+                calls.append(("type", text, delay_ms))
+                return True
+
+            async def paste_text(self, text: str, **_kwargs) -> bool:
+                calls.append(("paste", text, None))
+                return True
+
+            async def copy_text(self, _text: str) -> bool:
+                return True
+
+            async def backspace(self, _count: int) -> bool:
+                return True
+
+        ok = await paste.paste_final(
+            "Alpha beta ",
+            settle_seconds=0,
+            consume_timeout=0,
+            backend=FakeBackend(),
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("paste", "Alpha beta ", None)])
+
+    async def test_short_printable_ascii_can_use_legacy_type_first_mode(self) -> None:
         calls: list[tuple[str, str, int | None]] = []
 
         class FakeBackend:
@@ -105,6 +137,7 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
             "Alpha beta ",
             settle_seconds=0,
             consume_timeout=0,
+            prefer_clipboard_paste=False,
             backend=FakeBackend(),
         )
 
@@ -211,6 +244,36 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok)
         self.assertEqual(calls.count(("keys", 18)), len(paste.PASTE_CHORDS))
         self.assertEqual(calls[-1], ("restore", "text/plain", b"keep me"))
+
+    async def test_clipboard_failure_falls_back_to_direct_type(self) -> None:
+        calls: list[tuple[str, str, int | None]] = []
+
+        class FakeBackend:
+            name = "fake"
+
+            async def type_text(self, text: str, *, delay_ms: int) -> bool:
+                calls.append(("type", text, delay_ms))
+                return True
+
+            async def paste_text(self, text: str, **_kwargs) -> bool:
+                calls.append(("paste", text, None))
+                return False
+
+            async def copy_text(self, _text: str) -> bool:
+                return True
+
+            async def backspace(self, _count: int) -> bool:
+                return True
+
+        ok = await paste.paste_final(
+            "Alpha beta ",
+            settle_seconds=0,
+            consume_timeout=0,
+            backend=FakeBackend(),
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls, [("paste", "Alpha beta ", None), ("type", "Alpha beta ", 0)])
 
 
 if __name__ == "__main__":
