@@ -104,6 +104,7 @@
       "binding": "grave",
       "language": "uk",
       "stop_on_release_codes": [41],
+      "ignore_when_modifier_held": true,
       "combo": {
         "enabled": true,
         "hold_grab_until_release": true,

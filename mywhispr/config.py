@@ -125,6 +125,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "default_mode": "en",
             "language": "en",
             "stop_on_release_codes": [41],
+            # When true, a modifier held with the trigger (e.g. Shift+grave = "~",
+            # Ctrl/Alt/Super+grave shortcuts) is passed through instead of starting
+            # dictation. Set false to always trigger on the bare keycode.
+            "ignore_when_modifier_held": True,
             "combo": {
                 "enabled": True,
                 "hold_grab_until_release": True,

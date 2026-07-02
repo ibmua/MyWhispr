@@ -22,6 +22,8 @@ http://127.0.0.1:16666/
 
 - Hold-to-record dictation with release-to-insert behavior.
 - Configurable trigger key and combo shortcuts from the web UI.
+- Modifier-aware trigger: holding Shift/Ctrl/Alt/Super with the trigger passes
+  the real keystroke through (e.g. Shift+grave types `~`) instead of dictating.
 - Live transcript preview while recording.
 - Optional streaming into the focused app with guarded backspace/rewrite logic.
 - Local history for recent dictations, including in-memory WAV playback.
@@ -192,6 +194,36 @@ is released the next press starts a new recording immediately, while the
 previous recording is transcribed and inserted in the background. Takes queue
 up and land in the order they were spoken; the web UI header shows how many are
 still in flight.
+
+### Trigger Key And Modifiers
+
+By default MyWhispr only starts dictation on a **bare** press of the trigger
+key. If you hold a modifier at the same time, the real keystroke is passed
+through untouched, so the trigger stays usable for normal typing:
+
+- grave alone → starts dictation (hold to record, release to insert)
+- `Shift` + grave → types `~` (tilde)
+- `Ctrl` / `Alt` / `AltGr` / `Super` + grave → your usual shortcut
+
+This is standard behavior and needs no setup. It works because two things line
+up: the installed GNOME custom keybinding is bound to the exact bare key (so it
+never fires for modifier combos), and the daemon's evdev fallback skips a start
+when any of Shift, Ctrl, Alt, or Super is held.
+
+To turn it off (always start on the raw keycode, ignoring modifier state), set
+`ignore_when_modifier_held` to `false` on the trigger in `config.json`:
+
+```json
+"triggers": {
+  "grave": {
+    "binding": "grave",
+    "stop_on_release_codes": [41],
+    "ignore_when_modifier_held": false
+  }
+}
+```
+
+Restart the daemon after editing config: `systemctl --user restart mywhisprd`.
 
 ## Commands
 

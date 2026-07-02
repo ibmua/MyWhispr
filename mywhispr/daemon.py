@@ -34,6 +34,15 @@ from .model_specs import normalize_model_spec, resolve_project_python
 log = logging.getLogger(__name__)
 
 GRAVE_KEYCODE = 41
+# evdev keycodes for the modifier keys. If any of these is held when the
+# trigger key goes down, we treat it as a real keyboard shortcut (e.g.
+# Shift+grave = "~") and do NOT start dictation, letting the key pass through.
+MODIFIER_KEYCODES = frozenset({
+    42, 54,    # KEY_LEFTSHIFT, KEY_RIGHTSHIFT
+    29, 97,    # KEY_LEFTCTRL, KEY_RIGHTCTRL
+    56, 100,   # KEY_LEFTALT, KEY_RIGHTALT (Alt / AltGr / Option)
+    125, 126,  # KEY_LEFTMETA, KEY_RIGHTMETA (Super / Win / Cmd)
+})
 TRIGGER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_QUEUED_RECORDINGS = 16
 
@@ -502,11 +511,22 @@ class Daemon:
     def _maybe_start_from_keydown(self, code: int) -> None:
         if self.state != State.IDLE or self._start_queued:
             return
+        # A modifier held together with the trigger means the user wants the real
+        # keystroke (Shift+grave = "~", Ctrl/Alt/Super+grave = shortcuts), not
+        # dictation. Per-trigger "ignore_when_modifier_held" (default on) guards
+        # the evdev fallback; the GNOME custom binding already exact-matches the
+        # bare key, so it never fires for modifier combos.
+        modifier_held = code not in MODIFIER_KEYCODES and bool(
+            self._pressed_keycodes & MODIFIER_KEYCODES
+        )
         triggers = self.config.get("triggers") or {}
         for trigger, trig_cfg in triggers.items():
             stop_codes = set(int(c) for c in (trig_cfg.get("stop_on_release_codes") or [GRAVE_KEYCODE]))
             if code not in stop_codes:
                 continue
+            if modifier_held and trig_cfg.get("ignore_when_modifier_held", True):
+                log.info("ignored start: modifier held trigger=%s code=%s", trigger, code)
+                return
             if self._physical_start_task and not self._physical_start_task.done():
                 self._physical_start_task.cancel()
             self._physical_start_task = asyncio.create_task(self._physical_start_fallback(trigger, code))
