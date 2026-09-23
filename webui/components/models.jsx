@@ -232,6 +232,15 @@ function ModelCard({ m, active, onSelect, onDelete, onDownload, busy }) {
     <div
       className={className}
       onClick={handleClick}
+      role="button"
+      tabIndex={interactive && !busy && !downloading ? 0 : -1}
+      aria-label={`${m.label || m.name}: ${badge}`}
+      aria-disabled={!interactive || busy || downloading}
+      onKeyDown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault(); handleClick();
+        }
+      }}
       title={title}
     >
       <div className="model-top">
@@ -264,6 +273,8 @@ function ModelCard({ m, active, onSelect, onDelete, onDownload, busy }) {
           {(m.provider || "API")} <span className="dot">•</span> {m.api_model || m.name}
         </div>
       )}
+      <details className="model-details" onClick={(e) => e.stopPropagation()}>
+      <summary>{langs.length} {langs.length === 1 ? "language" : "languages"} · Model details</summary>
       {langs.length > 0 && (
         <div
           className="model-languages"
@@ -300,6 +311,7 @@ function ModelCard({ m, active, onSelect, onDelete, onDownload, busy }) {
         </div>
       )}
       <div className="model-path" title={m.path}>{m.path}</div>
+      </details>
     </div>
   );
 }

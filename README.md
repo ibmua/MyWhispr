@@ -14,9 +14,24 @@ http://127.0.0.1:16666/
 
 ## Screenshots
 
-![MyWhispr dashboard overview](docs/screenshots/dashboard-overview.png)
+The control panel separates everyday dictation from model management, settings,
+and system diagnostics. Screenshots below use sample transcripts and demo
+configuration; they contain no personal dictation history.
 
-![MyWhispr settings and shortcuts](docs/screenshots/settings-shortcuts.png)
+**Dictation** — live preview, the latest transcript, and language-filtered
+history with copy and retranscription controls.
+
+![MyWhispr dictation workspace with sample transcripts](docs/screenshots/dashboard-overview.png)
+
+**Models** — a responsive catalogue with active-model status and expandable
+language and model details.
+
+![MyWhispr demo model catalogue](docs/screenshots/model-catalogue.png)
+
+**Settings** — audio input, output preferences, keyboard shortcuts, and custom
+vocabulary in one place.
+
+![MyWhispr settings and shortcuts with demo configuration](docs/screenshots/settings-shortcuts.png)
 
 ## What It Does
 
@@ -277,6 +292,15 @@ MyWhispr is split into small local components:
 - `mywhispr/paste.py`: platform output backend for typing, paste, copy, and
   backspace.
 - `mywhispr/web.py` and `webui/`: local control-panel API and React UI.
+  `webui/app.jsx` owns four workspace views (Dictation, Models, Settings, System)
+  and API state; hidden panels stay mounted to preserve drafts and filters.
+  `webui/components/` owns each panel. `webui/app.css` owns shared design tokens
+  and responsive layouts (final Workspace design section); `webui/index.html`
+  owns asset cache versions and the `webui/favicon.svg` reference. These files
+  are served directly from disk: reload the browser after UI-only edits;
+  daemon changes still require a process restart. Model language/path details
+  use native disclosure controls; selecting a model retains the existing API.
+
 - `extensions/mywhispr@local/`: GNOME Shell top-bar indicator.
 
 The detailed implementation plan and design constraints live in

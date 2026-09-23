@@ -42,25 +42,31 @@ function CustomWordsCard({ words, onSave }) {
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onFocus={() => setFocused(true)}
-          onBlur={() => { setFocused(false); commitAll(); }}
+          onBlur={() => setFocused(false)}
           onKeyDown={(e) => {
+            // Commit only on an explicit Cmd/Ctrl+Enter — a plain Enter (or an
+            // injected newline from voice dictation / paste tools) just edits the
+            // draft, so dictating into this box no longer self-submits.
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.preventDefault(); commitAll(); inputRef.current?.blur();
-            } else if (e.key === "Enter" && !e.shiftKey && !draft.includes("\n")) {
               e.preventDefault(); commitAll();
             } else if (e.key === "Escape") {
               e.preventDefault(); setDraft(""); inputRef.current?.blur();
             }
           }}
           placeholder={expanded
-            ? "Type a word and press Enter. Paste a list (commas or newlines) to add many at once."
+            ? "Type or dictate words, then click Add (or press ⌘/Ctrl+Enter). Commas or newlines add many at once."
             : "Add words…"}
           rows={expanded ? 3 : 1}
         />
         {previewCount > 0 && (
-          <div className="words-input-hint">
-            <span>{previewCount} word{previewCount === 1 ? "" : "s"} ready · press Enter</span>
-          </div>
+          <button
+            type="button"
+            className="btn primary sm words-input-add"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={commitAll}
+          >
+            Add {previewCount} word{previewCount === 1 ? "" : "s"}
+          </button>
         )}
       </div>
 

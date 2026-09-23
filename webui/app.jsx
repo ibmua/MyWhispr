@@ -1,6 +1,7 @@
 // MyWhispr control-panel app — wired to the real daemon HTTP API
 
 function App() {
+  const [view, setView] = useState("dictation");
   const [snap, setSnap] = useState(null);          // /api/status
   const [config, setConfig] = useState(null);      // /api/config
   const [models, setModels] = useState(null);      // /api/models
@@ -309,14 +310,44 @@ function App() {
       {!online && (
         <div className="app-notice error">Daemon HTTP API is not reachable. Reconnecting…</div>
       )}
-      <main className="grid">
+      <nav className="workspace-nav" aria-label="Workspace">
+        {[
+          ["dictation", "Dictation", Icon.Mic],
+          ["models", "Models", Icon.Brain],
+          ["settings", "Settings", Icon.Settings],
+          ["system", "System", Icon.Bolt],
+        ].map(([id, label, NavIcon]) => (
+          <button key={id} type="button" aria-current={view === id ? "page" : undefined}
+            className={view === id ? "selected" : ""} onClick={() => setView(id)}>
+            <NavIcon />{label}
+          </button>
+        ))}
+      </nav>
+      <div className="workspace-heading">
+        <h1>{({dictation: "Your voice, in writing.", models: "Choose your voice engine.", settings: "Make it work your way.", system: "Behind the microphone."})[view]}</h1>
+        <p>{({dictation: "Hold your shortcut, speak naturally, then release to insert.", models: "Compare recognition models and manage your connections.", settings: "Audio, shortcuts and the words you use every day.", system: "Live connection and runtime details."})[view]}</p>
+      </div>
+      <main className={`grid workspace-grid view-${view}`}>
+        <div className="view-panel" hidden={view !== "dictation"}>
         <LiveTranscript
           state={state}
           livePreview={livePreview}
           lastFinal={lastFinal}
           currentLang={currentLang}
+          trigger={(config && config.triggers && config.triggers[DEFAULT_TRIGGER] && config.triggers[DEFAULT_TRIGGER].binding) || "grave"}
         />
 
+        <HistoryCard
+          history={history}
+          activeModel={activeModel}
+          models={models}
+          onCopy={copyText}
+          onClear={clearHistory}
+          onRetranslate={retranslate}
+          retranslate={snap && snap.retranslate}
+        />
+        </div>
+        <div className="view-panel" hidden={view !== "models"}>
         <ModelsCard
           models={models}
           activeModel={activeModel}
@@ -327,9 +358,11 @@ function App() {
           onDeleteModel={deleteModel}
           busy={modelBusy}
         />
-        <DaemonStatus
-          snap={snap}
-        />
+        </div>
+        <div className="view-panel" hidden={view !== "system"}>
+        <DaemonStatus snap={online ? snap : null} />
+        </div>
+        <div className="view-panel settings-panel" hidden={view !== "settings"}>
 
         <SettingsCard
           config={config}
@@ -351,20 +384,13 @@ function App() {
           busy={modelBusy}
         />
 
-        <HistoryCard
-          history={history}
-          activeModel={activeModel}
-          models={models}
-          onCopy={copyText}
-          onClear={clearHistory}
-          onRetranslate={retranslate}
-          retranslate={snap && snap.retranslate}
-        />
+
 
         <CustomWordsCard
           words={(config && config.custom_words) || []}
           onSave={saveCustomWords}
         />
+        </div>
       </main>
       <Footer webConfig={config && config.web} version={config && config.version} />
     </div>

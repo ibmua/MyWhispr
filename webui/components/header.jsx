@@ -21,10 +21,10 @@ function Header({ state, model, online, onRefresh, modelLoaded, queuePending = 0
   return (
     <header className="app-header">
       <div className="brand">
-        <div className="brand-mark"><Icon.Logo style={{ color: "#22c55e" }} /></div>
+        <div className="brand-mark"><Icon.Logo style={{ color: "var(--accent)" }} /></div>
         <div className="brand-title">
           <div className="brand-name">MyWhispr</div>
-          <div className="brand-sub">Local dictation daemon</div>
+          <div className="brand-sub">Your dictation workspace</div>
         </div>
       </div>
       <div className="header-status">
