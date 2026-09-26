@@ -73,8 +73,63 @@ MyWhispr separates transcription from output transport:
 - On Windows, the output backend maps the same operations to `SendInput` and
   the Win32 clipboard.
 
+On Wayland the previous clipboard contents are snapshotted and restored around
+each paste. A paste chord is a real keystroke, so the app's clipboard read can
+still be in flight long after the chord was delivered.
+`clipboard_paste_grace_seconds` (default 2.5) is how long the dictation keeps
+being offered before the snapshot goes back — restoring inside that window is
+what makes a slow app paste the *previously copied* text instead of the
+dictation. Lower it only if you would rather have a missed paste than a late
+one. (`clipboard_paste_consume_timeout_seconds` no longer affects the Wayland
+path: there is no observable "the app consumed it" signal — see below.)
+
+**No chord is sent until the dictation is really on the clipboard.** Spawning
+`wl-copy` does not mean it owns the selection yet. `wl-copy` *forks* once it has
+taken the selection, so the spawned process exiting is exactly the moment the
+clipboard is ours — measured on this desktop (wl-clipboard 2.2.1): ~32ms idle,
+but up to ~140ms under load, where 4/20 trials took longer than the 120ms this
+code used to wait blindly. A chord sent before that pastes whatever was on the
+clipboard before, i.e. the *previously copied* text, and still logs as a
+successful paste. MyWhispr therefore waits for that exit
+(`paste._CLIPBOARD_OWNERSHIP_TIMEOUT_SECONDS`, 1.5s) and, if it never comes,
+**drops the dictation rather than sending a keystroke it cannot back**
+(`clipboard ownership not confirmed …` in the log).
+
+**Whether the app actually pasted is not observable.** The forked child that
+serves the data is not ours to wait on, and on GNOME the clipboard manager reads
+the offer within ~20-35ms whether or not anything pasted. So the dictation
+always stays on the clipboard for at least
+`paste._MIN_HOLD_AFTER_CHORD_SECONDS` (0.6) after the last chord, even on the
+success path; restoring earlier is what made a busy app paste the previously
+copied text on an otherwise clean dictation. For the same reason the fallback
+chord (`shift+insert`) fires only when a keystroke could not be *delivered*,
+never on a "the app ignored it" guess.
+
+The grace window belongs to the clipboard, not to the paste call. Releasing the
+trigger key cancels the streaming session (`cancel_streaming_join_timeout`) and
+can land inside a grace wait, so the restore is handed to a detached release
+that keeps offering the dictation for the rest of the window before putting the
+snapshot back. While a release is still pending the clipboard holds MyWhispr's
+own text, so the next paste reuses that pending snapshot instead of re-reading
+the clipboard — otherwise the dictation itself would be handed back to you as
+your clipboard contents.
+
 This is intentionally content-agnostic. MyWhispr does not special-case phrases
 or leading words to decide whether insertion should work.
+
+Short printable ASCII dictation (up to `direct_type_max_chars`, 240 by
+default) is sent as one direct key stream by default. This bypasses clipboard
+transport but is not proof that duplicated insertion originates in Codex.
+Unicode, multiline, and longer text still use the guarded clipboard path above.
+Set `prefer_clipboard_paste` to `true` to restore clipboard-first routing.
+
+On this workstation `streaming.app_output_enabled=false`: preview remains
+available, but editor insertion waits for the final transcript. Interim
+backspace rewrites previously left partial duplicate phrases. Synthetic
+ydotool events must be ignored at the entry to `Daemon._on_key`, including
+release and combo handling, so output cannot change recording language or
+stop recording. Local `config.json` owns live settings; `mywhispr/config.py`
+and `config.example.json` supply defaults/examples, not effective overrides.
 
 ## Requirements
 

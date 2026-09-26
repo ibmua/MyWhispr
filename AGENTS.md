@@ -15,3 +15,12 @@ visible behavior too, such as the tray icon/menu or web UI.
 If you cannot safely reload the daemon, say that clearly and explain what is
 still running old code. Do not tell the user a daemon/tray change is working
 until the running process has actually been reloaded and checked.
+
+## Current State
+
+Read [`HANDOFF.md`](HANDOFF.md) for the latest session's findings and open items
+(most recently: the clipboard-restore race that made the app paste previously copied text).
+
+## Structure map
+
+Read [README.md](README.md#architecture) for the runtime and web UI ownership map.

@@ -69,8 +69,13 @@ class Transcriber:
         prompts = self.config.get("language_prompts") or {}
         prompt = prompts.get(language, "")
         if cw:
-            prompt = (prompt + "\nGlossary: " + ", ".join(cw)).strip()
-        return prompt
+            # Keep the prompt on ONE line: a newline inside the Whisper initial
+            # prompt destabilizes the decoder and causes word duplication
+            # ("Autism Assessment Assessment Questionnaire"). Same text joined
+            # with a space transcribes cleanly.
+            prompt = (prompt + " Glossary: " + ", ".join(cw)).strip()
+        # collapse any newline/whitespace a config value may carry in
+        return " ".join(prompt.split())
 
     async def transcribe(
         self,

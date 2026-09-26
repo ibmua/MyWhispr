@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 from dataclasses import dataclass
 import logging
 import os
 import re
 import sys
+import time
 from typing import Protocol
 
 log = logging.getLogger(__name__)
@@ -24,8 +26,30 @@ SHIFT_UP = "42:0"
 DEFAULT_PASTE_KEY_DELAY_MS = 18
 DEFAULT_TYPE_KEY_DELAY_MS = 0
 DEFAULT_DIRECT_TYPE_MAX_CHARS = 240
-DEFAULT_PREFER_CLIPBOARD_PASTE = True
+# Short printable ASCII is typed as one key stream by default, bypassing the
+# clipboard transport. This alone does not prove or fix duplicated insertion:
+# streaming rewrites and synthetic shortcut feedback also affect editor state.
+# Unicode, multiline, and long text still use clipboard paste.
+DEFAULT_PREFER_CLIPBOARD_PASTE = False
+# Extra time the dictation stays on the clipboard after the paste chords were
+# delivered but nothing has read it yet. The previous clipboard contents are
+# only restored once this expires, so a slow app cannot paste stale text.
+DEFAULT_PASTE_GRACE_SECONDS = 2.5
+# Floor for how long the dictation stays on the clipboard after a chord, even
+# when the offer looks consumed. On GNOME the clipboard manager takes a
+# `wl-copy --paste-once` offer within ~20-35ms whether or not anything pasted,
+# so "the process exited" does NOT mean the focused app has read it yet --
+# measured on this desktop with no keystroke sent at all. Restoring on that
+# signal puts the previous clipboard back milliseconds after the keystroke was
+# delivered, and any app that services the key later pastes that stale text.
+_MIN_HOLD_AFTER_CHORD_SECONDS = 0.6
 _CLIPBOARD_SNAPSHOT_TIMEOUT_SECONDS = 1.0
+# How long to wait for `wl-copy` to actually take the selection before giving up
+# on a paste. `wl-copy` forks once it owns the clipboard, so the spawned process
+# exiting IS the ownership signal (wl-clipboard 2.2.1, measured on this desktop:
+# ~32ms idle, up to ~140ms under load). Nothing may be pasted before that -- see
+# `_wayland_clipboard_paste`.
+_CLIPBOARD_OWNERSHIP_TIMEOUT_SECONDS = 1.5
 
 _ASCII_KEYCODES = {
     "a": 30, "b": 48, "c": 46, "d": 32, "e": 18, "f": 33, "g": 34,
@@ -72,6 +96,7 @@ class OutputBackend(Protocol):
         settle_seconds: float,
         consume_timeout: float,
         key_delay_ms: int,
+        grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     ) -> bool:
         ...
 
@@ -102,12 +127,14 @@ class LinuxWaylandYdotoolBackend:
         settle_seconds: float,
         consume_timeout: float,
         key_delay_ms: int,
+        grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     ) -> bool:
         return await _wayland_clipboard_paste(
             text,
             settle_seconds=settle_seconds,
             consume_timeout=consume_timeout,
             key_delay_ms=key_delay_ms,
+            grace_seconds=grace_seconds,
         )
 
     async def copy_text(self, text: str) -> bool:
@@ -132,7 +159,10 @@ class WindowsSendInputBackend:
         settle_seconds: float,
         consume_timeout: float,
         key_delay_ms: int,
+        grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     ) -> bool:
+        # Windows keeps the text on the clipboard (nothing is restored), so there
+        # is no in-flight window where a stale value could be pasted.
         if not await self.copy_text(text):
             return False
         await asyncio.sleep(max(settle_seconds, 0.03))
@@ -510,16 +540,34 @@ def _ascii_key_chord(ch: str) -> list[str] | None:
     return [down, up]
 
 
+# Busy Chromium/Electron apps (Claude desktop) drop keys when a whole sentence
+# arrives with zero spacing; typing one word per burst with a short pause between
+# bursts keeps them intact at near-full speed (ydotool type --key-delay is far slower).
+TYPE_BLOCK_GAP_SECONDS = 0.008
+
+
 async def _ydotool_type_ascii_fast(text: str) -> bool:
-    keycodes: list[str] = []
-    for ch in text:
-        chord = _ascii_key_chord(ch)
-        if chord is None:
-            return False
-        keycodes.extend(chord)
-    if not keycodes:
-        return True
-    return await _ydotool_keys(keycodes, delay_ms=0)
+    blocks: list[tuple[str, list[str]]] = []
+    for word in re.findall(r"\S*\s*", text):
+        if not word:
+            continue
+        keycodes: list[str] = []
+        for ch in word:
+            chord = _ascii_key_chord(ch)
+            if chord is None:
+                return False
+            keycodes.extend(chord)
+        blocks.append((word, keycodes))
+    for i, (_word, keycodes) in enumerate(blocks):
+        if i:
+            await asyncio.sleep(TYPE_BLOCK_GAP_SECONDS)
+        if not await _ydotool_keys(keycodes, delay_ms=0):
+            if i == 0:
+                return False
+            # Earlier words are already on screen: finish only the rest, never retype.
+            rest = "".join(w for w, _ in blocks[i:])
+            return await _ydotool_type(rest, delay_ms=DEFAULT_TYPE_KEY_DELAY_MS)
+    return True
 
 
 def _preferred_clipboard_mime_type(mime_types: list[str]) -> str | None:
@@ -587,37 +635,167 @@ async def _wayland_clipboard_paste(
     settle_seconds: float,
     consume_timeout: float,
     key_delay_ms: int,
+    grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
 ) -> bool:
-    snapshot = await _wayland_clipboard_snapshot()
+    snapshot = await _adopt_pending_snapshot()
+    if snapshot is None:
+        snapshot = await _wayland_clipboard_snapshot()
     if snapshot is None:
         return False
     proc = await _start_wl_copy(text, paste_once=True)
     if proc is None:
         return False
+    last_chord_at: float | None = None
+    offer_consumed = False
     try:
-        await asyncio.sleep(max(settle_seconds, 0.12))
+        # No chord may be sent until the dictation is REALLY on the clipboard.
+        # `wl-copy` forks once it has taken the selection, so the spawned
+        # process exiting is exactly that moment (measured: the clipboard reads
+        # back as ours in every trial right after the exit). This used to be a
+        # blind 120ms sleep, which under load lost the race in 4/20 trials --
+        # the chord then pasted whatever was on the clipboard before, i.e. the
+        # user's previously copied text, and still logged as a successful paste
+        # because the offer does get read a moment later.
+        owned = await _wait_wl_copy(
+            proc,
+            timeout=_CLIPBOARD_OWNERSHIP_TIMEOUT_SECONDS,
+            kill_on_timeout=False,
+        )
+        if not owned:
+            log.error(
+                "clipboard ownership not confirmed in %.1fs; dropping paste "
+                "instead of pasting stale clipboard chars=%d",
+                _CLIPBOARD_OWNERSHIP_TIMEOUT_SECONDS,
+                len(text),
+            )
+            return False
+        # Ownership is the only thing this handle can ever report: `wl-copy`
+        # forked, and the child that actually serves the data is not ours to
+        # wait on. So the dictation is on the clipboard now, and whether the
+        # app has *read* it is unobservable -- the hold below is what covers
+        # that, exactly as before.
+        offer_consumed = True
+        # The clipboard is now ours, so this is only the app's focus settle.
+        await asyncio.sleep(max(settle_seconds, 0.03))
+        # A chord is fire-and-hold. There is no signal that says the app pasted:
+        # the only handle we have exited at ownership, and the clipboard manager
+        # reads the offer within ~35ms whether or not anything pasted, so the
+        # old "did the chord consume the offer?" test was measuring nothing.
+        # The fallback chord is therefore for a keystroke that could not be
+        # DELIVERED (ydotool failed) -- not for one that was delivered and
+        # ignored, which we cannot detect. The dictation staying on the
+        # clipboard for the hold in `finally` is what covers a slow app.
         for name, chord in PASTE_CHORDS:
-            keys_ok = await _ydotool_keys(chord, delay_ms=key_delay_ms)
-            if not keys_ok:
+            if not await _ydotool_keys(chord, delay_ms=key_delay_ms):
                 log.warning("paste chord failed chord=%s", name)
                 continue
-            consumed = await _wait_wl_copy(
-                proc,
-                timeout=max(0.05, consume_timeout),
-                kill_on_timeout=False,
-            )
-            if consumed:
-                log.info("output method=paste backend=wayland chord=%s chars=%d", name, len(text))
-                return True
-            if proc.returncode is not None:
-                return False
-            log.warning("paste chord did not consume clipboard chord=%s", name)
+            last_chord_at = time.monotonic()
+            log.info("output method=paste backend=wayland chord=%s chars=%d", name, len(text))
+            return True
         return False
     finally:
-        await _stop_wl_copy(proc)
-        restored = await _restore_wayland_clipboard(snapshot)
-        if not restored:
-            log.warning("failed to restore clipboard after paste attempt")
+        # A chord is a real keystroke that cannot be recalled, so the dictation
+        # has to stay on the clipboard until the app has had its window to
+        # service it -- restoring earlier is what makes the app paste the
+        # previously copied text. The release is detached on purpose: the caller
+        # gets its turn back immediately (streaming pastes every ~0.45s, and
+        # releasing the trigger cancels this coroutine mid-wait), while the
+        # restore still happens on the clipboard's own schedule.
+        _ClipboardRelease(
+            proc,
+            snapshot,
+            hold_seconds=_remaining_hold(
+                last_chord_at, grace_seconds, consumed=offer_consumed
+            ),
+        )
+
+
+def _remaining_hold(
+    last_chord_at: float | None,
+    grace_seconds: float,
+    *,
+    consumed: bool,
+) -> float:
+    """How much longer the dictation must stay on the clipboard.
+
+    A consumed offer only proves *something* read it, so the app still gets a
+    floor. An unconsumed offer gets the full grace window.
+    """
+    if last_chord_at is None or grace_seconds <= 0:
+        return 0.0
+    owed = min(grace_seconds, _MIN_HOLD_AFTER_CHORD_SECONDS) if consumed else grace_seconds
+    return max(0.0, owed - (time.monotonic() - last_chord_at))
+
+
+_pending_release: "_ClipboardRelease | None" = None
+
+
+class _ClipboardRelease:
+    """Holds the dictation on the clipboard, then puts `snapshot` back.
+
+    The hold is a plain sleep rather than a wait on the `wl-copy` process: the
+    process exits as soon as *anything* reads the offer, and on GNOME that is
+    the clipboard manager rather than the focused app, so its exit says nothing
+    about whether the paste has landed.
+    """
+
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        snapshot: _WaylandClipboardSnapshot,
+        *,
+        hold_seconds: float,
+    ) -> None:
+        global _pending_release
+        self.proc = proc
+        self.snapshot = snapshot
+        self.hold_seconds = hold_seconds
+        self.restoring = False
+        _pending_release = self
+        self.task = asyncio.ensure_future(self._run())
+
+    async def _run(self) -> None:
+        global _pending_release
+        try:
+            if self.hold_seconds > 0:
+                await asyncio.sleep(self.hold_seconds)
+            self.restoring = True
+            await _stop_wl_copy(self.proc)
+            restored = await _restore_wayland_clipboard(self.snapshot)
+            if not restored:
+                log.warning("failed to restore clipboard after paste attempt")
+        finally:
+            if _pending_release is self:
+                _pending_release = None
+
+    def hand_over(self) -> _WaylandClipboardSnapshot | None:
+        """Give up the pending restore so a new paste can own the clipboard."""
+        if self.restoring or self.task.done():
+            return None
+        self.task.cancel()
+        return self.snapshot
+
+
+async def _adopt_pending_snapshot() -> _WaylandClipboardSnapshot | None:
+    """Reuse the snapshot of a release that has not restored yet.
+
+    While a release is still holding, the clipboard carries *our* dictation, so
+    reading it now would snapshot our own text and later hand it to the user as
+    their clipboard. The pending release already knows what was really there.
+    """
+    global _pending_release
+    release = _pending_release
+    if release is None:
+        return None
+    snapshot = release.hand_over()
+    if snapshot is None:
+        # Already restoring: let it finish, then read the clipboard normally.
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await release.task
+        return None
+    _pending_release = None
+    await _stop_wl_copy(release.proc)
+    return snapshot
 
 
 _windows_types: tuple | None = None
@@ -808,6 +986,7 @@ async def _paste_text(
     *,
     settle_seconds: float,
     consume_timeout: float,
+    grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     key_delay_ms: int,
     type_key_delay_ms: int,
     direct_type_max_chars: int,
@@ -829,6 +1008,7 @@ async def _paste_text(
             settle_seconds=settle_seconds,
             consume_timeout=consume_timeout,
             key_delay_ms=key_delay_ms,
+            grace_seconds=grace_seconds,
         )
         if pasted:
             return True
@@ -850,6 +1030,7 @@ async def _paste_text(
         settle_seconds=settle_seconds,
         consume_timeout=consume_timeout,
         key_delay_ms=key_delay_ms,
+        grace_seconds=grace_seconds,
     )
 
 
@@ -858,6 +1039,7 @@ async def paste_final(
     *,
     settle_seconds: float,
     consume_timeout: float,
+    grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     key_delay_ms: int = DEFAULT_PASTE_KEY_DELAY_MS,
     type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
     direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
@@ -869,6 +1051,7 @@ async def paste_final(
         text,
         settle_seconds=settle_seconds,
         consume_timeout=consume_timeout,
+        grace_seconds=grace_seconds,
         key_delay_ms=key_delay_ms,
         type_key_delay_ms=type_key_delay_ms,
         direct_type_max_chars=direct_type_max_chars,
@@ -885,6 +1068,7 @@ async def stream_replace(
     settle_seconds: float,
     max_rewrite_chars: int,
     consume_timeout: float = 1.5,
+    grace_seconds: float = DEFAULT_PASTE_GRACE_SECONDS,
     key_delay_ms: int = DEFAULT_PASTE_KEY_DELAY_MS,
     type_key_delay_ms: int = DEFAULT_TYPE_KEY_DELAY_MS,
     direct_type_max_chars: int = DEFAULT_DIRECT_TYPE_MAX_CHARS,
@@ -914,6 +1098,7 @@ async def stream_replace(
             addition,
             settle_seconds=settle_seconds,
             consume_timeout=consume_timeout,
+            grace_seconds=grace_seconds,
             key_delay_ms=key_delay_ms,
             type_key_delay_ms=type_key_delay_ms,
             direct_type_max_chars=direct_type_max_chars,

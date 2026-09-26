@@ -452,6 +452,11 @@ class Daemon:
 
     def _on_key(self, ev: KeyEvent) -> None:
         lower_name = (ev.device_name or "").lower()
+        # Output events must never re-enter recording controls. Filtering only
+        # physical-key bookkeeping still lets typed Shift switch language and
+        # typed grave releases stop the recording during streaming output.
+        if "ydotoold virtual device" in lower_name:
+            return
         if "ydotoold virtual device" not in lower_name:
             if ev.value == 1:
                 self._pressed_keycodes.add(ev.code)
@@ -1557,6 +1562,9 @@ async def _paste_job(d: Daemon, job: TranscriptionJob, text: str) -> bool:
     # reconcile against it; otherwise paste the final text.
     streaming_committed = job.stream.committed_text if job.stream is not None else ""
     type_kwargs = {
+        "grace_seconds": float(
+            d.config.get("clipboard_paste_grace_seconds", paste_mod.DEFAULT_PASTE_GRACE_SECONDS)
+        ),
         "type_key_delay_ms": int(d.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
         "direct_type_max_chars": int(d.config.get("direct_type_max_chars", 240)),
         "direct_type_ascii_only": bool(d.config.get("direct_type_ascii_only", True)),

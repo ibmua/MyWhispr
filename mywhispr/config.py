@@ -49,11 +49,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "minimum_recording_seconds": 0.25,
     "clipboard_settle_seconds": 0.03,
     "clipboard_paste_consume_timeout_seconds": 0.8,
+    "clipboard_paste_grace_seconds": 2.5,
     "paste_key_delay_ms": 18,
     "type_key_delay_ms": 0,
     "direct_type_max_chars": 240,
     "direct_type_ascii_only": True,
-    "prefer_clipboard_paste": True,
+    "prefer_clipboard_paste": False,
     "script_timeout_seconds": 45,
     "modes": {
         "uk": {"label": "Ukrainian", "type": "language", "language": "uk"},

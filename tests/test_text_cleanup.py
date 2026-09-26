@@ -57,6 +57,16 @@ class PasteRoutingTest(unittest.TestCase):
         self.assertFalse(paste._source_id_uses_us_keycodes(*paste._parse_ibus_engine("xkb:ua::ukr")))
 
 
+async def _settle_clipboard() -> None:
+    """The snapshot restore is deferred, so let the detached release finish."""
+    release = paste._pending_release
+    if release is not None:
+        try:
+            await release.task
+        except Exception:
+            pass
+
+
 class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
     async def test_layout_gate_uses_live_ibus_engine(self) -> None:
         async def fake_command(args, *, timeout=0.5):
@@ -84,7 +94,7 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
                 with patch.object(paste, "_command_stdout", fake_command):
                     self.assertFalse(await paste._linux_fast_type_safe_for_current_layout())
 
-    async def test_short_printable_ascii_prefers_clipboard_by_default(self) -> None:
+    async def test_short_printable_ascii_uses_single_direct_type_by_default(self) -> None:
         calls: list[tuple[str, str, int | None]] = []
 
         class FakeBackend:
@@ -112,9 +122,9 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(ok)
-        self.assertEqual(calls, [("paste", "Alpha beta ", None)])
+        self.assertEqual(calls, [("type", "Alpha beta ", 0)])
 
-    async def test_short_printable_ascii_can_use_legacy_type_first_mode(self) -> None:
+    async def test_short_printable_ascii_can_explicitly_use_type_first_mode(self) -> None:
         calls: list[tuple[str, str, int | None]] = []
 
         class FakeBackend:
@@ -190,7 +200,9 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
                                     settle_seconds=0,
                                     consume_timeout=0.2,
                                     key_delay_ms=18,
+                                    grace_seconds=0.05,
                                 )
+                                await _settle_clipboard()
 
         self.assertTrue(ok)
         self.assertEqual(calls[-1], ("restore", "text/plain;charset=utf-8", b"old clipboard"))
@@ -213,11 +225,12 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
 
         async def fake_keys(_chord, *, delay_ms: int | None = None):
             calls.append(("keys", delay_ms))
-            return True
+            return False  # the keystroke never reaches the compositor
 
         async def fake_wait(_proc, *, timeout: float, kill_on_timeout: bool = True):
+            # wl-copy exits at ownership: the dictation IS on the clipboard.
             calls.append(("wait", timeout, kill_on_timeout))
-            return False
+            return True
 
         async def fake_stop(_proc):
             proc.returncode = -15
@@ -239,7 +252,9 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
                                         settle_seconds=0,
                                         consume_timeout=0.2,
                                         key_delay_ms=18,
+                                        grace_seconds=0.05,
                                     )
+                                    await _settle_clipboard()
 
         self.assertFalse(ok)
         self.assertEqual(calls.count(("keys", 18)), len(paste.PASTE_CHORDS))
@@ -269,6 +284,7 @@ class PasteFinalTest(unittest.IsolatedAsyncioTestCase):
             "Alpha beta ",
             settle_seconds=0,
             consume_timeout=0,
+            prefer_clipboard_paste=True,
             backend=FakeBackend(),
         )
 

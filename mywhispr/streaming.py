@@ -135,6 +135,9 @@ class StreamingSession:
             settle_seconds=float(self.config.get("clipboard_settle_seconds", 0.03)),
             max_rewrite_chars=max_rewrite,
             consume_timeout=float(self.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+            grace_seconds=float(
+                self.config.get("clipboard_paste_grace_seconds", paste_mod.DEFAULT_PASTE_GRACE_SECONDS)
+            ),
             key_delay_ms=int(self.config.get("paste_key_delay_ms", 18)),
         )
         if ok:
@@ -318,6 +321,9 @@ class StreamingSession:
             settle_seconds=float(self.config.get("clipboard_settle_seconds", 0.03)),
             max_rewrite_chars=max_rewrite,
             consume_timeout=float(self.config.get("clipboard_paste_consume_timeout_seconds", 0.8)),
+            grace_seconds=float(
+                self.config.get("clipboard_paste_grace_seconds", paste_mod.DEFAULT_PASTE_GRACE_SECONDS)
+            ),
             key_delay_ms=int(self.config.get("paste_key_delay_ms", 18)),
             type_key_delay_ms=int(self.config.get("type_key_delay_ms", paste_mod.DEFAULT_TYPE_KEY_DELAY_MS)),
             direct_type_max_chars=int(self.config.get("direct_type_max_chars", 240)),

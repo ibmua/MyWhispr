@@ -84,11 +84,12 @@
   "stop_timeout_seconds": 3.0,
   "start_cooldown_seconds": 0.2,
   "clipboard_paste_consume_timeout_seconds": 0.8,
+  "clipboard_paste_grace_seconds": 2.5,
   "paste_key_delay_ms": 18,
   "type_key_delay_ms": 0,
   "direct_type_max_chars": 240,
   "direct_type_ascii_only": true,
-  "prefer_clipboard_paste": true,
+  "prefer_clipboard_paste": false,
   "audio_cues": {"enabled": true, "volume": 0.85, "start_recording_delay_seconds": 0.08},
   "streaming": {
     "app_output_enabled": true,

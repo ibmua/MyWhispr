@@ -54,6 +54,15 @@ class InputSupervisor:
         self._devices: dict[str, evdev.InputDevice] = {}
         self._tasks: dict[str, asyncio.Task] = {}
         self._grabbed: set[str] = set()
+        # Keys physically down at the moment a device was grabbed: the
+        # compositor saw their key-DOWN, so if their key-UP arrives while we
+        # hold the grab it is swallowed and the compositor is left believing
+        # the key is held forever (endless autorepeat of the trigger key,
+        # e.g. "`" typed on and on into newly focused windows). We track
+        # those swallowed releases and re-inject them into the device node
+        # on ungrab so the compositor's key state is balanced again.
+        self._down_at_grab: dict[str, set[int]] = {}
+        self._swallowed_releases: dict[str, set[int]] = {}
         self._udev_task: asyncio.Task | None = None
 
     def _device_matches_grab(self, name: str) -> bool:
@@ -124,6 +133,17 @@ class InputSupervisor:
             async for ev in dev.async_read_loop():
                 if ev.type != evdev.ecodes.EV_KEY:
                     continue
+                if dev.path in self._grabbed:
+                    down_at_grab = self._down_at_grab.get(dev.path) or set()
+                    if ev.value == 0 and ev.code in down_at_grab:
+                        self._swallowed_releases.setdefault(dev.path, set()).add(ev.code)
+                    elif ev.value == 1:
+                        # A fresh press during the grab means the compositor is
+                        # no longer owed a release for this key.
+                        down_at_grab.discard(ev.code)
+                        swallowed = self._swallowed_releases.get(dev.path)
+                        if swallowed:
+                            swallowed.discard(ev.code)
                 self._on_key(KeyEvent(dev.path, dev.name or "", ev.code, ev.value))
         except OSError:
             pass
@@ -172,6 +192,11 @@ class InputSupervisor:
             try:
                 dev.grab()
                 self._grabbed.add(path)
+                try:
+                    self._down_at_grab[path] = set(dev.active_keys())
+                except Exception:
+                    self._down_at_grab[path] = set()
+                self._swallowed_releases.pop(path, None)
                 n += 1
             except Exception as e:
                 log.warning("grab failed path=%s err=%s", path, e)
@@ -186,12 +211,34 @@ class InputSupervisor:
             dev = self._devices.get(path)
             if dev is None:
                 self._grabbed.discard(path)
+                self._down_at_grab.pop(path, None)
+                self._swallowed_releases.pop(path, None)
                 continue
             try:
                 dev.ungrab()
             except Exception:
                 pass
             self._grabbed.discard(path)
+            self._down_at_grab.pop(path, None)
+            # Re-inject key-UPs the grab swallowed so the compositor does not
+            # keep autorepeating a key it thinks is still held (stuck-` bug).
+            swallowed = self._swallowed_releases.pop(path, None)
+            if swallowed:
+                # A bare key-UP write is dropped by the kernel (the key is
+                # already up in the input-core state), so inject a full
+                # press+release tap: the press propagates and the release
+                # balances the compositor's stuck-down state. Worst case the
+                # tap re-fires the trigger shortcut once, which the daemon
+                # ignores (require_physical_trigger_down / not-held).
+                try:
+                    for code in swallowed:
+                        dev.write(evdev.ecodes.EV_KEY, code, 1)
+                        dev.write(evdev.ecodes.EV_SYN, evdev.ecodes.SYN_REPORT, 0)
+                        dev.write(evdev.ecodes.EV_KEY, code, 0)
+                        dev.write(evdev.ecodes.EV_SYN, evdev.ecodes.SYN_REPORT, 0)
+                    log.info("re-injected swallowed release path=%s codes=%s", path, sorted(swallowed))
+                except Exception as e:
+                    log.warning("release re-inject failed path=%s err=%s", path, e)
         log.info("grab released")
 
     def device_names(self) -> list[str]:
